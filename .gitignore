@@ -1,0 +1,57 @@
+# Environment files
+.env
+*.env
+.env.*
+!.env.example
+!*.env.example
+
+# Python virtual environments
+.venv/
+venv/
+backend/.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# AWS Lambda build outputs
+backend/package/
+backend/lambda_deploy.zip
+backend/*.zip
+package/
+lambda_deploy.zip
+
+# Flutter / Dart generated files
+qr_phishing_app/.dart_tool/
+qr_phishing_app/build/
+qr_phishing_app/.flutter-plugins
+qr_phishing_app/.flutter-plugins-dependencies
+qr_phishing_app/api_config.json
+
+# Android / Gradle generated files
+qr_phishing_app/android/.gradle/
+qr_phishing_app/android/.kotlin/
+qr_phishing_app/android/app/build/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets / keys
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+credentials
+credentials.*
+credentials.json
+aws_credentials*
+.aws/
