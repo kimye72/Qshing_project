@@ -80,6 +80,10 @@ def _make_dashboard_item(item: Dict[str, Any]) -> Dict[str, Any]:
         "qr_type": safe_item.get("qr_type") or raw_result.get("qr_type"),
         "contains_url": safe_item.get("contains_url", analysis_flags.get("contains_url", False)),
         "url_count": safe_item.get("url_count"),
+        "text_score": safe_item.get("text_score"),
+        "embedded_url_count": safe_item.get("embedded_url_count", 0),
+        "analyzed_embedded_url_count": safe_item.get("analyzed_embedded_url_count", 0),
+        "embedded_url_max_score": safe_item.get("embedded_url_max_score"),
         "url": safe_item.get("url"),
         "domain": safe_item.get("domain") or raw_result.get("domain"),
         "local_score": safe_item.get("local_score"),
@@ -130,6 +134,12 @@ def save_scan_result(result: Dict[str, Any]) -> Dict[str, Any]:
         "qr_type": result.get("qr_type"),
         "contains_url": bool(result.get("contains_url", False)),
         "url_count": len(result.get("extracted_urls") or []),
+        "text_score": result.get("text_score"),
+        "embedded_url_count": int(result.get("embedded_url_count", 0) or 0),
+        "analyzed_embedded_url_count": int(
+            result.get("analyzed_embedded_url_count", 0) or 0
+        ),
+        "embedded_url_max_score": result.get("embedded_url_max_score"),
         "url": result.get("url", ""),
         "domain": result.get("domain", ""),
         "decoded_url": result.get("decoded_url"),

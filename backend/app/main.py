@@ -1,5 +1,6 @@
 import os
 import secrets
+import logging
 from typing import Literal
 from urllib.parse import urlparse
 
@@ -7,7 +8,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from mangum import Mangum
 
-from app.constants import RULESET_VERSION
+from app.constants import MAX_EMBEDDED_URLS_ANALYZED, RULESET_VERSION
 from app.schemas import (
     QRAnalyzeRequest,
     QRAnalyzeResponse,
@@ -28,6 +29,7 @@ from app.services.url_cache import analyze_url_with_cache
 APP_VERSION = "0.4.0"
 HTTP_URL_PREFIXES = ("http://", "https://")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
+logger = logging.getLogger(__name__)
 
 
 app = FastAPI(
@@ -200,6 +202,126 @@ def resolve_direct_http_url(content: str) -> str | None:
     return analysis_url
 
 
+def _status_and_message_for_qr(risk_score: int) -> tuple[str, str]:
+    if risk_score >= 70:
+        return (
+            "danger",
+            "위험 가능성이 높은 QR입니다. 자동 실행하거나 안내된 행동을 바로 수행하지 마세요.",
+        )
+    if risk_score >= 30:
+        return (
+            "warning",
+            "주의가 필요한 QR입니다. 포함된 연락처, 계좌, 인증번호 요청 등을 반드시 확인하세요.",
+        )
+    return (
+        "safe",
+        "URL이 아닌 QR입니다. 현재 기준으로는 높은 위험 요소가 발견되지 않았습니다.",
+    )
+
+
+def _embedded_url_response(result: dict, analysis_url: str) -> dict:
+    return {
+        "url": result.get("url", analysis_url),
+        "domain": result.get("domain"),
+        "local_score": int(result.get("local_score", result.get("risk_score", 0))),
+        "vt_score_delta": int(result.get("vt_score_delta", 0)),
+        "final_score": int(result.get("final_score", result.get("risk_score", 0))),
+        "risk_score": int(result.get("risk_score", result.get("final_score", 0))),
+        "status": result.get("status", "safe"),
+        "reasons": list(result.get("reasons") or []),
+        "analysis_flags": dict(result.get("analysis_flags") or {}),
+        "ruleset_version": result.get("ruleset_version", RULESET_VERSION),
+        "vt_available": bool(result.get("vt_available", False)),
+        "vt_source": result.get("vt_source"),
+        "vt_malicious": int(result.get("vt_malicious", 0) or 0),
+        "vt_suspicious": int(result.get("vt_suspicious", 0) or 0),
+        "vt_harmless": int(result.get("vt_harmless", 0) or 0),
+        "vt_undetected": int(result.get("vt_undetected", 0) or 0),
+        "cache_hit": bool(result.get("cache_hit", False)),
+        "cache_age_seconds": result.get("cache_age_seconds"),
+        "cache_revalidated": bool(result.get("cache_revalidated", False)),
+        "revalidation_reason": result.get("revalidation_reason"),
+    }
+
+
+def analyze_text_with_embedded_urls(result: dict) -> dict:
+    """Combine existing text risk with up to three distinct embedded URL results."""
+    extracted_urls = list(result.get("extracted_urls") or [])
+    unique_urls = list(dict.fromkeys(extracted_urls))
+    embedded_results: list[dict] = []
+
+    for extracted_url in unique_urls[:MAX_EMBEDDED_URLS_ANALYZED]:
+        try:
+            analysis_url = resolve_direct_http_url(extracted_url)
+            if analysis_url is None:
+                continue
+            url_result = analyze_url_with_cache(
+                analysis_url,
+                analyzer=analyze_url,
+                analysis_context="embedded",
+            )
+            url_result = ensure_analysis_contract(url_result)
+            embedded_results.append(
+                _embedded_url_response(url_result, analysis_url)
+            )
+        except Exception as exc:
+            logger.warning(
+                "Embedded URL analysis failed: %s",
+                type(exc).__name__,
+            )
+
+    text_score = int(result.get("risk_score", 0))
+    embedded_scores = [item["final_score"] for item in embedded_results]
+    embedded_url_max_score = max(embedded_scores) if embedded_scores else None
+    final_score = max(text_score, embedded_url_max_score or 0)
+    status, message = _status_and_message_for_qr(final_score)
+
+    reasons = list(result.get("reasons") or [])
+    if embedded_results:
+        pending_reason = "일반 텍스트 안에 URL이 포함되어 있습니다. 포함된 URL 분석이 필요합니다."
+        completed_reason = "일반 텍스트 안에 URL이 포함되어 있어 포함 URL 분석을 수행했습니다."
+        reasons = [
+            completed_reason if reason == pending_reason else reason
+            for reason in reasons
+        ]
+    high_risk_count = sum(
+        item["status"] == "danger" for item in embedded_results
+    )
+    if high_risk_count:
+        reasons.append("포함된 URL 분석에서 높은 위험도가 탐지되었습니다.")
+    elif embedded_url_max_score is not None and embedded_url_max_score >= 30:
+        reasons.append("포함된 URL 분석에서 주의가 필요한 위험도가 탐지되었습니다.")
+
+    analysis_flags = dict(result.get("analysis_flags") or {})
+    analysis_flags.update(
+        {
+            "embedded_url_analyzed": bool(embedded_results),
+            "embedded_url_count": len(unique_urls),
+            "analyzed_embedded_url_count": len(embedded_results),
+            "embedded_url_high_risk_count": high_risk_count,
+        }
+    )
+
+    result.update(
+        {
+            "text_score": text_score,
+            "embedded_url_count": len(unique_urls),
+            "analyzed_embedded_url_count": len(embedded_results),
+            "embedded_url_max_score": embedded_url_max_score,
+            "embedded_url_results": embedded_results,
+            "local_score": text_score,
+            "vt_score_delta": 0,
+            "final_score": final_score,
+            "risk_score": final_score,
+            "status": status,
+            "message": message,
+            "reasons": reasons,
+            "analysis_flags": analysis_flags,
+        }
+    )
+    return result
+
+
 @app.get(
     "/",
     summary="서버 상태 확인",
@@ -268,6 +390,8 @@ def analyze_qr(data: QRAnalyzeRequest):
 
     else:
         result = analyze_non_url_qr(content)
+        if result.get("qr_type") == "text_with_url":
+            result = analyze_text_with_embedded_urls(result)
 
     result = ensure_analysis_contract(result)
     return persist_scan_history(result)

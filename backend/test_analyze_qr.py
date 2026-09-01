@@ -40,6 +40,41 @@ def make_url_result(url: str) -> dict:
     }
 
 
+def make_scored_url_result(url: str, score: int) -> dict:
+    result = make_url_result(url)
+    status = "danger" if score >= 70 else "warning" if score >= 30 else "safe"
+    result.update(
+        {
+            "local_score": score,
+            "final_score": score,
+            "risk_score": score,
+            "status": status,
+            "message": f"URL score {score}",
+        }
+    )
+    return result
+
+
+def make_text_with_url_result(urls: list[str], score: int) -> dict:
+    status = "danger" if score >= 70 else "warning" if score >= 30 else "safe"
+    return {
+        "qr_type": "text_with_url",
+        "raw_content_preview": "안내 텍스트",
+        "contains_url": True,
+        "extracted_urls": list(urls),
+        "url": urls[0] if urls else None,
+        "domain": "example.com" if urls else None,
+        "risk_score": score,
+        "status": status,
+        "message": f"Text score {score}",
+        "reasons": [
+            "일반 텍스트 안에 URL이 포함되어 있습니다. 포함된 URL 분석이 필요합니다."
+        ],
+        "analysis_flags": {"contains_url": True},
+        "raw_result": {"qr_type": "text_with_url"},
+    }
+
+
 def make_db_result() -> dict:
     return {
         "saved": True,
@@ -111,6 +146,10 @@ def make_cache_item(url: str, *, checked_at: int, **updates) -> dict:
         "analyzed_at": checked_at,
         "last_checked_at": checked_at,
     }
+    if "direct_history_initialized" in updates:
+        item["direct_history_initialized"] = updates[
+            "direct_history_initialized"
+        ]
     return item
 
 
@@ -253,9 +292,42 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
         self.assertEqual(result["risk_score"], result["final_score"])
         self.assertEqual(result["ruleset_version"], "1.0")
 
-    def test_embedded_url_keeps_non_url_analysis(self):
+    def _analyze_embedded_scores(
+        self,
+        *,
+        text_score: int,
+        url_scores: list[int],
+    ):
+        urls = [f"https://example{i}.com/login" for i in range(len(url_scores))]
+        result_by_url = {
+            url: make_scored_url_result(url, score)
+            for url, score in zip(urls, url_scores)
+        }
         with (
-            patch("app.main.analyze_url_with_cache") as cache_mock,
+            patch(
+                "app.main.analyze_non_url_qr",
+                return_value=make_text_with_url_result(urls, text_score),
+            ),
+            patch(
+                "app.main.analyze_url_with_cache",
+                side_effect=lambda url, **_: result_by_url[url],
+            ) as cache_mock,
+            patch(
+                "app.main.save_scan_result",
+                return_value=make_db_result(),
+            ) as db_mock,
+        ):
+            result = main.analyze_qr(
+                QRAnalyzeRequest(content="안내: " + " ".join(urls))
+            )
+        return result, cache_mock, db_mock
+
+    def test_embedded_url_keeps_text_with_url_parent_type(self):
+        with (
+            patch(
+                "app.main.analyze_url_with_cache",
+                side_effect=lambda url, **_: make_url_result(url),
+            ) as cache_mock,
             patch(
                 "app.main.save_scan_result",
                 return_value=make_db_result(),
@@ -265,11 +337,251 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
                 QRAnalyzeRequest(content="안내: https://example.com/login")
             )
 
-        cache_mock.assert_not_called()
+        cache_mock.assert_called_once()
+        self.assertEqual(
+            cache_mock.call_args.kwargs["analysis_context"],
+            "embedded",
+        )
         db_mock.assert_called_once()
         self.assertEqual(result["qr_type"], "text_with_url")
         self.assertTrue(result["contains_url"])
         self.assertEqual(result["risk_score"], 15)
+        self.assertEqual(result["text_score"], 15)
+        self.assertEqual(result["embedded_url_max_score"], 10)
+
+    def test_text_score_wins_over_safe_embedded_url(self):
+        result, cache_mock, db_mock = self._analyze_embedded_scores(
+            text_score=20,
+            url_scores=[10],
+        )
+
+        self.assertEqual(result["final_score"], 20)
+        self.assertEqual(result["risk_score"], 20)
+        self.assertEqual(result["local_score"], 20)
+        self.assertEqual(result["vt_score_delta"], 0)
+        self.assertEqual(result["embedded_url_max_score"], 10)
+        cache_mock.assert_called_once()
+        db_mock.assert_called_once()
+
+    def test_dangerous_embedded_url_sets_parent_danger(self):
+        result, _, db_mock = self._analyze_embedded_scores(
+            text_score=20,
+            url_scores=[80],
+        )
+
+        self.assertEqual(result["final_score"], 80)
+        self.assertEqual(result["status"], "danger")
+        self.assertIn(
+            "포함된 URL 분석에서 높은 위험도가 탐지되었습니다.",
+            result["reasons"],
+        )
+        db_mock.assert_called_once()
+
+    def test_dangerous_text_wins_over_safe_embedded_url(self):
+        result, _, _ = self._analyze_embedded_scores(
+            text_score=70,
+            url_scores=[10],
+        )
+
+        self.assertEqual(result["text_score"], 70)
+        self.assertEqual(result["embedded_url_max_score"], 10)
+        self.assertEqual(result["final_score"], 70)
+        self.assertEqual(result["status"], "danger")
+
+    def test_two_embedded_urls_use_max_score(self):
+        result, cache_mock, _ = self._analyze_embedded_scores(
+            text_score=20,
+            url_scores=[10, 55],
+        )
+
+        self.assertEqual(result["embedded_url_max_score"], 55)
+        self.assertEqual(result["final_score"], 55)
+        self.assertEqual(cache_mock.call_count, 2)
+
+    def test_three_embedded_urls_use_max_score(self):
+        result, cache_mock, _ = self._analyze_embedded_scores(
+            text_score=20,
+            url_scores=[10, 30, 80],
+        )
+
+        self.assertEqual(result["embedded_url_max_score"], 80)
+        self.assertEqual(result["final_score"], 80)
+        self.assertEqual(result["analyzed_embedded_url_count"], 3)
+        self.assertEqual(cache_mock.call_count, 3)
+
+    def test_more_than_three_embedded_urls_are_limited(self):
+        urls = [f"https://example{i}.com" for i in range(4)]
+        with (
+            patch(
+                "app.main.analyze_non_url_qr",
+                return_value=make_text_with_url_result(urls, 20),
+            ),
+            patch(
+                "app.main.analyze_url_with_cache",
+                side_effect=lambda url, **_: make_url_result(url),
+            ) as cache_mock,
+            patch("app.main.save_scan_result", return_value=make_db_result()),
+        ):
+            result = main.analyze_qr(
+                QRAnalyzeRequest(content="안내: " + " ".join(urls))
+            )
+
+        self.assertEqual(result["embedded_url_count"], 4)
+        self.assertEqual(result["analyzed_embedded_url_count"], 3)
+        self.assertEqual(len(result["extracted_urls"]), 4)
+        self.assertEqual(cache_mock.call_count, 3)
+
+    def test_duplicate_embedded_url_is_analyzed_once(self):
+        url = "https://example.com/login"
+        with (
+            patch(
+                "app.main.analyze_non_url_qr",
+                return_value=make_text_with_url_result([url, url, url], 20),
+            ),
+            patch(
+                "app.main.analyze_url_with_cache",
+                side_effect=lambda value, **_: make_url_result(value),
+            ) as cache_mock,
+            patch("app.main.save_scan_result", return_value=make_db_result()),
+        ):
+            result = main.analyze_qr(
+                QRAnalyzeRequest(content=f"안내: {url} {url} {url}")
+            )
+
+        self.assertEqual(result["extracted_urls"], [url, url, url])
+        self.assertEqual(result["embedded_url_count"], 1)
+        self.assertEqual(result["analyzed_embedded_url_count"], 1)
+        cache_mock.assert_called_once()
+
+    def test_embedded_analysis_failure_returns_text_result(self):
+        url = "https://example.com"
+        with (
+            patch(
+                "app.main.analyze_non_url_qr",
+                return_value=make_text_with_url_result([url], 45),
+            ),
+            patch(
+                "app.main.analyze_url_with_cache",
+                side_effect=RuntimeError("internal failure"),
+            ),
+            patch("app.main.logger.warning") as log_mock,
+            patch(
+                "app.main.save_scan_result",
+                return_value=make_db_result(),
+            ) as db_mock,
+        ):
+            result = main.analyze_qr(
+                QRAnalyzeRequest(content=f"안내: {url}")
+            )
+
+        self.assertEqual(result["text_score"], 45)
+        self.assertEqual(result["final_score"], 45)
+        self.assertEqual(result["analyzed_embedded_url_count"], 0)
+        self.assertEqual(result["embedded_url_results"], [])
+        log_mock.assert_called_once()
+        db_mock.assert_called_once()
+
+    def test_malformed_embedded_url_does_not_fail_parent(self):
+        with patch(
+            "app.main.save_scan_result",
+            return_value=make_db_result(),
+        ) as db_mock:
+            result = main.analyze_qr(
+                QRAnalyzeRequest(content="안내: http://[::1")
+            )
+
+        self.assertEqual(result["qr_type"], "text_with_url")
+        self.assertEqual(result["final_score"], result["text_score"])
+        self.assertEqual(result["analyzed_embedded_url_count"], 0)
+        db_mock.assert_called_once()
+
+    def test_vt_disabled_uses_local_embedded_url_score(self):
+        with (
+            patch(
+                "app.services.scanner.get_url_report",
+                return_value={"enabled": False, "available": False},
+            ),
+            patch("app.main.save_scan_result", return_value=make_db_result()),
+        ):
+            result = main.analyze_qr(
+                QRAnalyzeRequest(content="안내: https://example.com")
+            )
+
+        self.assertEqual(result["embedded_url_max_score"], 10)
+        self.assertEqual(result["embedded_url_results"][0]["vt_score_delta"], 0)
+        self.assertFalse(result["embedded_url_results"][0]["vt_available"])
+
+    def test_embedded_cache_then_direct_scan_preserves_direct_initial_history(self):
+        url = "https://example.com"
+        state = {"item": None}
+
+        def get_cached(_url):
+            return dict(state["item"]) if state["item"] else None
+
+        def save_cached(value, analysis_result, **kwargs):
+            now = kwargs["now_epoch"]
+            item = make_cache_item(value, checked_at=now)
+            item["direct_history_initialized"] = kwargs.get(
+                "direct_history_initialized"
+            )
+            if kwargs.get("increment_scan"):
+                item.update(
+                    {
+                        "scan_count": 1,
+                        "first_seen_at": now,
+                        "last_scanned_at": now,
+                    }
+                )
+            state["item"] = item
+
+        def record_scan(_url_hash, *, scanned_at):
+            state["item"]["scan_count"] = state["item"].get("scan_count", 0) + 1
+            state["item"].setdefault("first_seen_at", scanned_at)
+            state["item"]["last_scanned_at"] = scanned_at
+            state["item"]["direct_history_initialized"] = True
+
+        with (
+            patch.object(url_cache, "URL_CACHE_ENABLED", True),
+            patch.object(
+                url_cache,
+                "get_cached_url_analysis",
+                side_effect=get_cached,
+            ),
+            patch.object(
+                url_cache,
+                "save_cached_url_analysis",
+                side_effect=save_cached,
+            ),
+            patch.object(
+                url_cache,
+                "record_cached_url_scan",
+                side_effect=record_scan,
+            ),
+            patch("app.main.analyze_url", side_effect=make_url_result) as analyzer,
+            patch(
+                "app.main.save_scan_result",
+                return_value=make_db_result(),
+            ) as db_mock,
+        ):
+            parent = main.analyze_qr(
+                QRAnalyzeRequest(content=f"안내: {url}")
+            )
+            first_direct = main.analyze_qr(QRAnalyzeRequest(content=url))
+            second_direct = main.analyze_qr(QRAnalyzeRequest(content=url))
+
+        self.assertEqual(parent["qr_type"], "text_with_url")
+        self.assertEqual(first_direct["history_event_type"], "initial_analysis")
+        self.assertFalse(second_direct["history_saved"])
+        self.assertEqual(second_direct["history_skip_reason"], "duplicate_unchanged")
+        self.assertEqual(analyzer.call_count, 1)
+        self.assertEqual(state["item"]["scan_count"], 2)
+        self.assertEqual(db_mock.call_count, 2)
+        self.assertEqual(db_mock.call_args_list[0].args[0]["qr_type"], "text_with_url")
+        self.assertEqual(
+            db_mock.call_args_list[1].args[0]["history_event_type"],
+            "initial_analysis",
+        )
+        QRAnalyzeResponse.model_validate(parent)
 
     def test_scheme_less_candidate_keeps_non_url_analysis(self):
         with (
@@ -670,6 +982,44 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
 
         self.assertEqual(table.item["history_event_type"], "risk_changed")
 
+    def test_text_with_url_db_stores_summary_without_embedded_results(self):
+        class CapturingTable:
+            item = None
+
+            def put_item(self, *, Item):
+                self.item = Item
+
+        result = make_text_with_url_result(["https://example.com"], 20)
+        result.update(
+            {
+                "text_score": 20,
+                "embedded_url_count": 1,
+                "analyzed_embedded_url_count": 1,
+                "embedded_url_max_score": 55,
+                "embedded_url_results": [
+                    make_scored_url_result("https://example.com", 55)
+                ],
+                "local_score": 20,
+                "vt_score_delta": 0,
+                "final_score": 55,
+                "risk_score": 55,
+                "ruleset_version": "1.0",
+            }
+        )
+        table = CapturingTable()
+        with (
+            patch.object(database, "DYNAMODB_ENABLED", True),
+            patch("app.services.database._get_table", return_value=table),
+        ):
+            database.save_scan_result(result)
+
+        self.assertEqual(table.item["text_score"], 20)
+        self.assertEqual(table.item["embedded_url_count"], 1)
+        self.assertEqual(table.item["analyzed_embedded_url_count"], 1)
+        self.assertEqual(table.item["embedded_url_max_score"], 55)
+        self.assertNotIn("embedded_url_results", table.item)
+        self.assertNotIn("extracted_urls", table.item)
+
     def test_dashboard_preserves_new_metadata(self):
         item = {
             "scan_id": "test-id",
@@ -873,9 +1223,17 @@ class UrlCacheTests(unittest.TestCase):
         expression = table.update["UpdateExpression"]
         self.assertIn("if_not_exists(#first_seen_at, :scanned_at)", expression)
         self.assertIn("ADD #scan_count :one", expression)
+        self.assertIn(
+            "#direct_history_initialized = :direct_history_initialized",
+            expression,
+        )
         self.assertEqual(
             table.update["ExpressionAttributeValues"],
-            {":scanned_at": 1100, ":one": 1},
+            {
+                ":scanned_at": 1100,
+                ":direct_history_initialized": True,
+                ":one": 1,
+            },
         )
 
     def test_cache_miss_analyzes_and_saves(self):
@@ -894,10 +1252,120 @@ class UrlCacheTests(unittest.TestCase):
         self.scan_record_mock.assert_not_called()
         save_mock.assert_called_once()
         self.assertTrue(save_mock.call_args.kwargs["increment_scan"])
+        self.assertTrue(
+            save_mock.call_args.kwargs["direct_history_initialized"]
+        )
         self.assertFalse(result["cache_hit"])
         self.assertEqual(result["revalidation_reason"], "cache_miss")
         self.assertTrue(result["_history_should_save"])
         self.assertEqual(result["_history_event_type"], "initial_analysis")
+
+    def test_embedded_cache_miss_does_not_record_direct_scan_or_history(self):
+        analyzer = Mock(return_value=make_url_result("https://example.com"))
+        with (
+            patch.object(url_cache, "get_cached_url_analysis", return_value=None),
+            patch.object(url_cache, "save_cached_url_analysis") as save_mock,
+        ):
+            result = url_cache.analyze_url_with_cache(
+                "https://example.com",
+                analyzer=analyzer,
+                now_epoch=1000,
+                analysis_context="embedded",
+            )
+
+        analyzer.assert_called_once_with("https://example.com")
+        self.scan_record_mock.assert_not_called()
+        save_mock.assert_called_once()
+        self.assertFalse(save_mock.call_args.kwargs["increment_scan"])
+        self.assertFalse(
+            save_mock.call_args.kwargs["direct_history_initialized"]
+        )
+        self.assertNotIn("_history_should_save", result)
+        self.assertNotIn("_history_event_type", result)
+
+    def test_fresh_embedded_cache_hit_skips_analyzer_vt_and_scan_counter(self):
+        cached = make_cache_item(
+            "https://example.com",
+            checked_at=950,
+            direct_history_initialized=False,
+        )
+        analyzer = Mock()
+        with patch.object(
+            url_cache,
+            "get_cached_url_analysis",
+            return_value=cached,
+        ):
+            result = url_cache.analyze_url_with_cache(
+                "https://example.com",
+                analyzer=analyzer,
+                now_epoch=1000,
+                analysis_context="embedded",
+            )
+
+        analyzer.assert_not_called()
+        self.scan_record_mock.assert_not_called()
+        self.assertTrue(result["cache_hit"])
+        self.assertEqual(result["cache_age_seconds"], 50)
+        self.assertNotIn("_history_should_save", result)
+
+    def test_direct_scan_of_embedded_created_cache_requests_initial_history(self):
+        cached = make_cache_item(
+            "https://example.com",
+            checked_at=950,
+            direct_history_initialized=False,
+        )
+        with patch.object(
+            url_cache,
+            "get_cached_url_analysis",
+            return_value=cached,
+        ):
+            result = url_cache.analyze_url_with_cache(
+                "https://example.com",
+                analyzer=Mock(),
+                now_epoch=1000,
+            )
+
+        self.scan_record_mock.assert_called_once_with(
+            cached["url_hash"],
+            scanned_at=1000,
+        )
+        self.assertTrue(result["cache_hit"])
+        self.assertTrue(result["_history_should_save"])
+        self.assertEqual(result["_history_event_type"], "initial_analysis")
+
+    def test_stale_embedded_cache_revalidates_without_direct_history(self):
+        current = make_vt_url_result("https://example.com")
+        cached = make_cache_item(
+            "https://example.com",
+            checked_at=800,
+            direct_history_initialized=False,
+            **{
+                key: value
+                for key, value in current.items()
+                if key in url_cache._CACHE_RESULT_FIELDS
+            },
+        )
+        analyzer = Mock(return_value=current)
+        with (
+            patch.object(
+                url_cache,
+                "get_cached_url_analysis",
+                return_value=cached,
+            ),
+            patch.object(url_cache, "update_cache_check_time") as update_mock,
+        ):
+            result = url_cache.analyze_url_with_cache(
+                "https://example.com",
+                analyzer=analyzer,
+                now_epoch=1000,
+                analysis_context="embedded",
+            )
+
+        analyzer.assert_called_once()
+        self.scan_record_mock.assert_not_called()
+        update_mock.assert_called_once()
+        self.assertTrue(result["cache_revalidated"])
+        self.assertNotIn("_history_should_save", result)
 
     def test_fresh_cache_hit_skips_analyzer(self):
         cached = make_cache_item("https://example.com", checked_at=950)

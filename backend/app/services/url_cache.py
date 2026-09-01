@@ -3,7 +3,7 @@ import logging
 import os
 from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 import boto3
 from dotenv import load_dotenv
@@ -158,6 +158,7 @@ def save_cached_url_analysis(
     vt_checked_at: int | None = None,
     previous_item: dict[str, Any] | None = None,
     increment_scan: bool = False,
+    direct_history_initialized: bool | None = None,
 ) -> None:
     now = _utc_epoch_seconds() if now_epoch is None else int(now_epoch)
     checked_at = now if last_checked_at is None else int(last_checked_at)
@@ -185,6 +186,10 @@ def save_cached_url_analysis(
 
     if vt_checked_at is not None:
         analysis_values["vt_checked_at"] = int(vt_checked_at)
+    if direct_history_initialized is not None:
+        analysis_values["direct_history_initialized"] = bool(
+            direct_history_initialized
+        )
 
     if previous_item:
         if _risk_changed(previous_item, result):
@@ -253,15 +258,19 @@ def record_cached_url_scan(url_hash: str, *, scanned_at: int) -> None:
         Key={"url_hash": url_hash},
         UpdateExpression=(
             "SET #first_seen_at = if_not_exists(#first_seen_at, :scanned_at), "
-            "#last_scanned_at = :scanned_at ADD #scan_count :one"
+            "#last_scanned_at = :scanned_at, "
+            "#direct_history_initialized = :direct_history_initialized "
+            "ADD #scan_count :one"
         ),
         ExpressionAttributeNames={
             "#first_seen_at": "first_seen_at",
             "#last_scanned_at": "last_scanned_at",
+            "#direct_history_initialized": "direct_history_initialized",
             "#scan_count": "scan_count",
         },
         ExpressionAttributeValues={
             ":scanned_at": int(scanned_at),
+            ":direct_history_initialized": True,
             ":one": 1,
         },
     )
@@ -398,6 +407,39 @@ def _with_history_policy(
     return result
 
 
+def _with_context_history_policy(
+    result: dict[str, Any],
+    *,
+    analysis_context: Literal["direct", "embedded"],
+    should_save: bool,
+    event_type: str | None,
+) -> dict[str, Any]:
+    if analysis_context == "embedded":
+        result.pop("_history_should_save", None)
+        result.pop("_history_event_type", None)
+        return result
+    return _with_history_policy(
+        result,
+        should_save=should_save,
+        event_type=event_type,
+    )
+
+
+def _cached_history_policy(
+    *,
+    scan_recorded: bool,
+    needs_initial_history: bool,
+    risk_changed: bool = False,
+) -> tuple[bool, str | None]:
+    if not scan_recorded:
+        return True, "cache_fallback"
+    if needs_initial_history:
+        return True, "initial_analysis"
+    if risk_changed:
+        return True, "risk_changed"
+    return False, None
+
+
 def _virustotal_is_configured() -> bool:
     return bool(virustotal.VIRUSTOTAL_ENABLED and virustotal.VIRUSTOTAL_API_KEY)
 
@@ -486,12 +528,17 @@ def analyze_url_with_cache(
     *,
     analyzer: Callable[[str], dict[str, Any]] = analyze_url,
     now_epoch: int | None = None,
+    analysis_context: Literal["direct", "embedded"] = "direct",
 ) -> dict[str, Any]:
     """Analyze a URL with an optional, failure-isolated DynamoDB cache."""
+    if analysis_context not in {"direct", "embedded"}:
+        raise ValueError("Unsupported URL analysis context")
+
     now = _utc_epoch_seconds() if now_epoch is None else int(now_epoch)
+    is_direct = analysis_context == "direct"
 
     if not URL_CACHE_ENABLED:
-        return _with_history_policy(
+        return _with_context_history_policy(
             _with_cache_metadata(
                 analyzer(url),
                 cache_hit=False,
@@ -499,6 +546,7 @@ def analyze_url_with_cache(
                 cache_revalidated=False,
                 revalidation_reason=None,
             ),
+            analysis_context=analysis_context,
             should_save=True,
             event_type=None,
         )
@@ -520,9 +568,14 @@ def analyze_url_with_cache(
                 result,
                 now_epoch=now,
                 vt_checked_at=vt_checked_at,
-                increment_scan=True,
+                increment_scan=is_direct,
+                direct_history_initialized=(
+                    True
+                    if is_direct
+                    else False if cached is None else None
+                ),
             )
-        return _with_history_policy(
+        return _with_context_history_policy(
             _with_cache_metadata(
                 result,
                 cache_hit=False,
@@ -530,6 +583,7 @@ def analyze_url_with_cache(
                 cache_revalidated=False,
                 revalidation_reason=None if lookup_failed else "cache_miss",
             ),
+            analysis_context=analysis_context,
             should_save=True,
             event_type=(
                 "cache_fallback"
@@ -541,9 +595,16 @@ def analyze_url_with_cache(
     age = get_cache_age_seconds(cached, now_epoch=now)
     ruleset_matches = cached.get("ruleset_version") == RULESET_VERSION
     url_hash = cached["url_hash"]
-    scan_recorded = _try_record_scan(url_hash, now)
+    needs_initial_history = (
+        is_direct and cached.get("direct_history_initialized") is False
+    )
+    scan_recorded = _try_record_scan(url_hash, now) if is_direct else True
     if ruleset_matches and is_cache_fresh(cached, now_epoch=now):
-        return _with_history_policy(
+        should_save, event_type = _cached_history_policy(
+            scan_recorded=scan_recorded,
+            needs_initial_history=needs_initial_history,
+        )
+        return _with_context_history_policy(
             _with_cache_metadata(
                 _restore_cached_result(url, cached),
                 cache_hit=True,
@@ -551,15 +612,20 @@ def analyze_url_with_cache(
                 cache_revalidated=False,
                 revalidation_reason=None,
             ),
-            should_save=not scan_recorded,
-            event_type=None if scan_recorded else "cache_fallback",
+            analysis_context=analysis_context,
+            should_save=should_save,
+            event_type=event_type,
         )
 
     reason = "stale_cache" if ruleset_matches else "ruleset_changed"
 
     if ruleset_matches and not _virustotal_is_configured():
         _try_record_deferred(url_hash, now)
-        return _with_history_policy(
+        should_save, event_type = _cached_history_policy(
+            scan_recorded=scan_recorded,
+            needs_initial_history=needs_initial_history,
+        )
+        return _with_context_history_policy(
             _with_cache_metadata(
                 _restore_cached_result(url, cached),
                 cache_hit=False,
@@ -567,8 +633,9 @@ def analyze_url_with_cache(
                 cache_revalidated=False,
                 revalidation_reason=reason,
             ),
-            should_save=not scan_recorded,
-            event_type=None if scan_recorded else "cache_fallback",
+            analysis_context=analysis_context,
+            should_save=should_save,
+            event_type=event_type,
         )
 
     result = analyzer(url)
@@ -576,7 +643,11 @@ def analyze_url_with_cache(
 
     if ruleset_matches and not has_current_vt_report:
         _try_record_deferred(url_hash, now)
-        return _with_history_policy(
+        should_save, event_type = _cached_history_policy(
+            scan_recorded=scan_recorded,
+            needs_initial_history=needs_initial_history,
+        )
+        return _with_context_history_policy(
             _with_cache_metadata(
                 _restore_cached_result(url, cached),
                 cache_hit=False,
@@ -584,8 +655,9 @@ def analyze_url_with_cache(
                 cache_revalidated=False,
                 revalidation_reason=reason,
             ),
-            should_save=not scan_recorded,
-            event_type=None if scan_recorded else "cache_fallback",
+            analysis_context=analysis_context,
+            should_save=should_save,
+            event_type=event_type,
         )
 
     if not ruleset_matches and not has_current_vt_report and _has_historical_vt_result(cached):
@@ -601,7 +673,12 @@ def analyze_url_with_cache(
             vt_checked_at=previous_vt_checked_at,
             previous_item=cached,
         )
-        return _with_history_policy(
+        should_save, event_type = _cached_history_policy(
+            scan_recorded=scan_recorded,
+            needs_initial_history=needs_initial_history,
+            risk_changed=risk_changed,
+        )
+        return _with_context_history_policy(
             _with_cache_metadata(
                 result,
                 cache_hit=False,
@@ -609,12 +686,9 @@ def analyze_url_with_cache(
                 cache_revalidated=False,
                 revalidation_reason=reason,
             ),
-            should_save=risk_changed or not scan_recorded,
-            event_type=(
-                "risk_changed"
-                if risk_changed
-                else None if scan_recorded else "cache_fallback"
-            ),
+            analysis_context=analysis_context,
+            should_save=should_save,
+            event_type=event_type,
         )
 
     risk_changed = _risk_changed(cached, result)
@@ -636,7 +710,12 @@ def analyze_url_with_cache(
             previous_item=cached,
         )
 
-    return _with_history_policy(
+    should_save, event_type = _cached_history_policy(
+        scan_recorded=scan_recorded,
+        needs_initial_history=needs_initial_history,
+        risk_changed=risk_changed,
+    )
+    return _with_context_history_policy(
         _with_cache_metadata(
             result,
             cache_hit=False,
@@ -644,10 +723,7 @@ def analyze_url_with_cache(
             cache_revalidated=True,
             revalidation_reason=reason,
         ),
-        should_save=risk_changed or not scan_recorded,
-        event_type=(
-            "risk_changed"
-            if risk_changed
-            else None if scan_recorded else "cache_fallback"
-        ),
+        analysis_context=analysis_context,
+        should_save=should_save,
+        event_type=event_type,
     )

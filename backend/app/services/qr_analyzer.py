@@ -220,7 +220,10 @@ def analyze_non_url_qr(content: str) -> dict:
         reasons.append("URL이 아닌 일반 텍스트 QR로 분류되었습니다.")
 
     first_url = extracted_urls[0] if extracted_urls else None
-    domain = urlparse(first_url).netloc if first_url else None
+    try:
+        domain = urlparse(first_url).netloc if first_url else None
+    except (ValueError, UnicodeError):
+        domain = None
 
     return {
         "qr_type": qr_type,

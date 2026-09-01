@@ -6,6 +6,32 @@ from pydantic import BaseModel, Field, HttpUrl, TypeAdapter, field_validator
 _HTTP_URL_ADAPTER = TypeAdapter(HttpUrl)
 
 
+class EmbeddedUrlResult(BaseModel):
+    url: str = Field(..., description="분석한 포함 URL")
+    domain: Optional[str] = Field(default=None, description="포함 URL 도메인")
+    local_score: int = Field(..., description="포함 URL의 로컬 규칙 점수")
+    vt_score_delta: int = Field(..., description="포함 URL의 VirusTotal 가산 점수")
+    final_score: int = Field(..., description="포함 URL의 최종 위험 점수")
+    risk_score: int = Field(..., description="포함 URL의 최종 위험 점수 호환 필드")
+    status: Literal["safe", "warning", "danger"] = Field(..., description="포함 URL 상태")
+    reasons: List[str] = Field(default_factory=list, description="포함 URL 판단 사유")
+    analysis_flags: Optional[Dict[str, Any]] = Field(default=None, description="포함 URL 분석 플래그")
+    ruleset_version: str = Field(..., description="포함 URL 분석 규칙 버전")
+    vt_available: bool = Field(default=False, description="VT 리포트 사용 가능 여부")
+    vt_source: Optional[str] = Field(default=None, description="VT 결과 출처")
+    vt_malicious: int = Field(default=0, description="VT 악성 탐지 수")
+    vt_suspicious: int = Field(default=0, description="VT 의심 탐지 수")
+    vt_harmless: int = Field(default=0, description="VT 무해 탐지 수")
+    vt_undetected: int = Field(default=0, description="VT 미탐지 수")
+    cache_hit: bool = Field(default=False, description="fresh URL 캐시 사용 여부")
+    cache_age_seconds: Optional[int] = Field(default=None, ge=0, description="캐시 경과 시간")
+    cache_revalidated: bool = Field(default=False, description="요청 중 재검증 여부")
+    revalidation_reason: Optional[Literal["cache_miss", "ruleset_changed", "stale_cache"]] = Field(
+        default=None,
+        description="캐시 미사용 또는 재검증 사유",
+    )
+
+
 class ScanRequest(BaseModel):
     url: str = Field(
         ...,
@@ -77,6 +103,14 @@ class QRAnalyzeResponse(BaseModel):
     raw_content_preview: str = Field(..., description="마스킹 처리된 QR 내용 미리보기")
     contains_url: bool = Field(..., description="QR 내용에 URL이 포함되어 있는지 여부")
     extracted_urls: List[str] = Field(default_factory=list, description="QR 내용에서 추출된 URL 목록")
+    text_score: Optional[int] = Field(default=None, description="텍스트 자체 위험 점수")
+    embedded_url_count: int = Field(default=0, description="중복 제거된 포함 URL 수")
+    analyzed_embedded_url_count: int = Field(default=0, description="실제 분석에 성공한 포함 URL 수")
+    embedded_url_max_score: Optional[int] = Field(default=None, description="포함 URL 중 최고 최종 점수")
+    embedded_url_results: List[EmbeddedUrlResult] = Field(
+        default_factory=list,
+        description="분석된 포함 URL별 결과",
+    )
 
     url: Optional[str] = Field(default=None, description="분석 대상 URL")
     domain: Optional[str] = Field(default=None, description="도메인")
