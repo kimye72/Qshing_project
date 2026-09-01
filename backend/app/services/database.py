@@ -79,6 +79,14 @@ def _make_dashboard_item(item: Dict[str, Any]) -> Dict[str, Any]:
         "scan_id": safe_item.get("scan_id"),
         "qr_type": safe_item.get("qr_type") or raw_result.get("qr_type"),
         "contains_url": safe_item.get("contains_url", analysis_flags.get("contains_url", False)),
+        "contains_url_candidate": safe_item.get(
+            "contains_url_candidate",
+            analysis_flags.get("contains_url_candidate", False),
+        ),
+        "candidate_url_count": safe_item.get(
+            "candidate_url_count",
+            analysis_flags.get("url_candidate_count", 0),
+        ),
         "url_count": safe_item.get("url_count"),
         "text_score": safe_item.get("text_score"),
         "embedded_url_count": safe_item.get("embedded_url_count", 0),
@@ -133,6 +141,10 @@ def save_scan_result(result: Dict[str, Any]) -> Dict[str, Any]:
         "history_event_type": result.get("history_event_type"),
         "qr_type": result.get("qr_type"),
         "contains_url": bool(result.get("contains_url", False)),
+        "contains_url_candidate": bool(
+            result.get("contains_url_candidate", False)
+        ),
+        "candidate_url_count": int(result.get("candidate_url_count", 0) or 0),
         "url_count": len(result.get("extracted_urls") or []),
         "text_score": result.get("text_score"),
         "embedded_url_count": int(result.get("embedded_url_count", 0) or 0),

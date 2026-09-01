@@ -106,6 +106,9 @@ def require_admin_api_key(
 def ensure_analysis_contract(result: dict) -> dict:
     """Add common metadata without changing an analyzer's existing decision."""
     risk_score = int(result.get("risk_score", 0))
+    result.setdefault("contains_url_candidate", False)
+    result.setdefault("extracted_url_candidates", [])
+    result.setdefault("candidate_url_count", 0)
     result.setdefault("local_score", risk_score)
     result.setdefault("vt_score_delta", 0)
     result["final_score"] = risk_score
@@ -180,6 +183,9 @@ def resolve_direct_http_url(content: str) -> str | None:
     elif decoded_content.lower().startswith(HTTP_URL_PREFIXES):
         analysis_url = decoded_content
     else:
+        return None
+
+    if any(character.isspace() for character in analysis_url):
         return None
 
     try:

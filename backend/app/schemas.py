@@ -103,6 +103,18 @@ class QRAnalyzeResponse(BaseModel):
     raw_content_preview: str = Field(..., description="마스킹 처리된 QR 내용 미리보기")
     contains_url: bool = Field(..., description="QR 내용에 URL이 포함되어 있는지 여부")
     extracted_urls: List[str] = Field(default_factory=list, description="QR 내용에서 추출된 URL 목록")
+    contains_url_candidate: bool = Field(
+        default=False,
+        description="프로토콜이 없는 URL 후보 포함 여부",
+    )
+    extracted_url_candidates: List[str] = Field(
+        default_factory=list,
+        description="프로토콜이 없는 URL 후보 목록",
+    )
+    candidate_url_count: int = Field(
+        default=0,
+        description="중복 제거된 프로토콜 없는 URL 후보 수",
+    )
     text_score: Optional[int] = Field(default=None, description="텍스트 자체 위험 점수")
     embedded_url_count: int = Field(default=0, description="중복 제거된 포함 URL 수")
     analyzed_embedded_url_count: int = Field(default=0, description="실제 분석에 성공한 포함 URL 수")

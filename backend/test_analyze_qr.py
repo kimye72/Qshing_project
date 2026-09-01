@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from app import main
 from app.schemas import QRAnalyzeRequest, QRAnalyzeResponse, ScanRequest, ScanResponse
-from app.services import database, url_cache
+from app.services import database, qr_analyzer, url_cache
 from app.services.qr_analyzer import analyze_non_url_qr
 from app.services.scanner import analyze_url
 
@@ -583,15 +583,135 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
         )
         QRAnalyzeResponse.model_validate(parent)
 
-    def test_scheme_less_candidate_keeps_non_url_analysis(self):
+    def test_scheme_less_candidate_is_reported_without_url_analysis(self):
         with (
             patch("app.main.analyze_url_with_cache") as cache_mock,
             patch("app.main.save_scan_result", return_value=make_db_result()),
+            patch.object(
+                qr_analyzer,
+                "extract_url_candidates",
+                wraps=qr_analyzer.extract_url_candidates,
+            ) as candidate_extractor,
         ):
             result = main.analyze_qr(QRAnalyzeRequest(content="example.com"))
 
         cache_mock.assert_not_called()
-        self.assertEqual(result["qr_type"], "text")
+        candidate_extractor.assert_called_once()
+        self.assertEqual(result["qr_type"], "text_with_url")
+        self.assertFalse(result["contains_url"])
+        self.assertTrue(result["contains_url_candidate"])
+        self.assertEqual(result["extracted_url_candidates"], ["example.com"])
+        self.assertEqual(result["candidate_url_count"], 1)
+        self.assertEqual(result["text_score"], 15)
+        self.assertEqual(result["embedded_url_results"], [])
+        QRAnalyzeResponse.model_validate(result)
+
+    def test_scheme_less_candidate_preserves_path_and_original_case(self):
+        for content, expected in (
+            ("www.example.com/login", "www.example.com/login"),
+            ("WWW.Example.COM/Login", "WWW.Example.COM/Login"),
+            ("sub.example.com/path?q=test", "sub.example.com/path?q=test"),
+        ):
+            with self.subTest(content=content):
+                result = analyze_non_url_qr(content)
+                self.assertEqual(result["extracted_url_candidates"], [expected])
+
+    def test_candidate_is_extracted_from_korean_text(self):
+        result = analyze_non_url_qr(
+            "로그인은 example.co.kr/account에서 하세요"
+        )
+
+        self.assertEqual(result["qr_type"], "text_with_url")
+        self.assertEqual(
+            result["extracted_url_candidates"],
+            ["example.co.kr/account"],
+        )
+
+    def test_http_url_is_not_duplicated_as_candidate(self):
+        with (
+            patch(
+                "app.main.analyze_url_with_cache",
+                side_effect=lambda url, **_: make_url_result(url),
+            ) as cache_mock,
+            patch("app.main.save_scan_result", return_value=make_db_result()),
+        ):
+            result = main.analyze_qr(
+                QRAnalyzeRequest(content="https://example.com")
+            )
+
+        cache_mock.assert_called_once()
+        self.assertEqual(result["extracted_urls"], ["https://example.com"])
+        self.assertFalse(result["contains_url_candidate"])
+        self.assertEqual(result["extracted_url_candidates"], [])
+
+    def test_http_url_and_candidate_are_separate_without_double_scoring(self):
+        content = "https://example.com 그리고 example.org"
+        with (
+            patch(
+                "app.main.analyze_url_with_cache",
+                side_effect=lambda url, **_: make_url_result(url),
+            ) as cache_mock,
+            patch("app.main.save_scan_result", return_value=make_db_result()),
+        ):
+            result = main.analyze_qr(QRAnalyzeRequest(content=content))
+
+        cache_mock.assert_called_once()
+        self.assertEqual(cache_mock.call_args.args[0], "https://example.com")
+        self.assertEqual(result["extracted_urls"], ["https://example.com"])
+        self.assertEqual(result["extracted_url_candidates"], ["example.org"])
+        self.assertEqual(result["text_score"], 15)
+
+    def test_email_file_and_ipv4_are_not_candidates(self):
+        for content, expected_type in (
+            ("user@example.com", "email_text"),
+            ("document.pdf", "text"),
+            ("image.png", "text"),
+            ("192.168.0.1", "text"),
+        ):
+            with self.subTest(content=content):
+                result = analyze_non_url_qr(content)
+                self.assertEqual(result["qr_type"], expected_type)
+                self.assertFalse(result["contains_url_candidate"])
+                self.assertEqual(result["extracted_url_candidates"], [])
+
+    def test_candidate_deduplication_is_case_insensitive_and_preserves_first(self):
+        result = analyze_non_url_qr(
+            "Example.com example.com EXAMPLE.COM"
+        )
+
+        self.assertEqual(result["extracted_url_candidates"], ["Example.com"])
+        self.assertEqual(result["candidate_url_count"], 1)
+
+    def test_candidate_response_list_is_limited_to_ten(self):
+        content = " ".join(f"site{index}.example" for index in range(11))
+        with (
+            patch("app.main.analyze_url_with_cache") as cache_mock,
+            patch("app.main.save_scan_result", return_value=make_db_result()),
+        ):
+            result = main.analyze_qr(QRAnalyzeRequest(content=content))
+
+        cache_mock.assert_not_called()
+        self.assertEqual(result["candidate_url_count"], 11)
+        self.assertEqual(len(result["extracted_url_candidates"]), 10)
+
+    def test_punycode_candidate_does_not_add_a_new_risk_rule(self):
+        result = analyze_non_url_qr("xn--example-xxxx.com")
+
+        self.assertEqual(
+            result["extracted_url_candidates"],
+            ["xn--example-xxxx.com"],
+        )
+        self.assertEqual(result["risk_score"], 15)
+
+    def test_existing_non_url_types_remain_classified(self):
+        for content, expected_type in (
+            ("010-1234-5678", "phone_text"),
+            ("user@example.com", "email_text"),
+            ("SMS:01012345678:hello", "sms"),
+            ("WIFI:T:WPA;S:test;P:password;;", "wifi"),
+        ):
+            with self.subTest(content=content):
+                self.assertEqual(analyze_non_url_qr(content)["qr_type"], expected_type)
 
     def test_malformed_ipv6_is_client_error_without_internal_detail(self):
         with self.assertRaises(HTTPException) as raised:
@@ -1019,6 +1139,25 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
         self.assertEqual(table.item["embedded_url_max_score"], 55)
         self.assertNotIn("embedded_url_results", table.item)
         self.assertNotIn("extracted_urls", table.item)
+
+    def test_candidate_db_stores_only_summary_metadata(self):
+        class CapturingTable:
+            item = None
+
+            def put_item(self, *, Item):
+                self.item = Item
+
+        result = main.ensure_analysis_contract(analyze_non_url_qr("example.com"))
+        table = CapturingTable()
+        with (
+            patch.object(database, "DYNAMODB_ENABLED", True),
+            patch("app.services.database._get_table", return_value=table),
+        ):
+            database.save_scan_result(result)
+
+        self.assertTrue(table.item["contains_url_candidate"])
+        self.assertEqual(table.item["candidate_url_count"], 1)
+        self.assertNotIn("extracted_url_candidates", table.item)
 
     def test_dashboard_preserves_new_metadata(self):
         item = {

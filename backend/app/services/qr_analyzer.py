@@ -1,11 +1,50 @@
 import re
 from urllib.parse import unquote, urlparse
 
+from app.constants import MAX_URL_CANDIDATES
+
 
 URL_PATTERN = re.compile(
     r"https?://[^\s<>'\"]+",
     re.IGNORECASE
 )
+
+DOMAIN_LABEL_PATTERN = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+URL_CANDIDATE_PATTERN = re.compile(
+    rf"(?<![A-Za-z0-9@._-])"
+    rf"(?P<candidate>"
+    rf"(?P<domain>(?:{DOMAIN_LABEL_PATTERN}\.)+"
+    rf"(?:[A-Za-z]{{2,63}}|xn--[A-Za-z0-9-]{{2,59}}))"
+    rf"(?P<suffix>[/?#][A-Za-z0-9._~:/?#\[\]@!$&()*+,;=%-]*)?"
+    rf")"
+    rf"(?![A-Za-z0-9-])",
+    re.IGNORECASE,
+)
+
+DOMAIN_LABEL_VALIDATOR = re.compile(rf"^{DOMAIN_LABEL_PATTERN}$", re.IGNORECASE)
+PUNYCODE_TLD_PATTERN = re.compile(r"^xn--[A-Za-z0-9-]{2,59}$", re.IGNORECASE)
+
+COMMON_FILE_EXTENSIONS = {
+    "csv",
+    "dll",
+    "doc",
+    "docx",
+    "exe",
+    "gif",
+    "jpeg",
+    "jpg",
+    "json",
+    "pdf",
+    "png",
+    "ppt",
+    "pptx",
+    "svg",
+    "txt",
+    "xls",
+    "xlsx",
+    "xml",
+    "zip",
+}
 
 PHONE_PATTERN = re.compile(
     r"01[016789][-\s]?\d{3,4}[-\s]?\d{4}"
@@ -100,14 +139,76 @@ def extract_urls(content: str) -> list[str]:
     return URL_PATTERN.findall(content)
 
 
-def detect_qr_type(content: str) -> str:
+def _spans_overlap(first: tuple[int, int], second: tuple[int, int]) -> bool:
+    return first[0] < second[1] and second[0] < first[1]
+
+
+def _is_valid_domain_candidate(domain: str, *, has_suffix: bool) -> bool:
+    if len(domain) > 253:
+        return False
+
+    labels = domain.split(".")
+    if len(labels) < 2 or any(
+        not DOMAIN_LABEL_VALIDATOR.fullmatch(label) for label in labels
+    ):
+        return False
+
+    tld = labels[-1]
+    if not (tld.isalpha() or PUNYCODE_TLD_PATTERN.fullmatch(tld)):
+        return False
+
+    if not has_suffix and tld.lower() in COMMON_FILE_EXTENSIONS:
+        return False
+
+    return True
+
+
+def extract_url_candidates(content: str) -> list[str]:
+    """Extract validated schemeless domain candidates without inferring a scheme."""
+    excluded_spans = [match.span() for match in URL_PATTERN.finditer(content)]
+    excluded_spans.extend(match.span() for match in EMAIL_PATTERN.finditer(content))
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    for match in URL_CANDIDATE_PATTERN.finditer(content):
+        if any(_spans_overlap(match.span(), span) for span in excluded_spans):
+            continue
+
+        candidate = match.group("candidate").rstrip(".,;:!?)]}")
+        if not candidate:
+            continue
+
+        domain = match.group("domain")
+        has_suffix = len(candidate) > len(domain)
+        if not _is_valid_domain_candidate(domain, has_suffix=has_suffix):
+            continue
+
+        dedupe_key = candidate.casefold()
+        if dedupe_key in seen:
+            continue
+
+        seen.add(dedupe_key)
+        candidates.append(candidate)
+
+    return candidates
+
+
+def detect_qr_type(
+    content: str,
+    *,
+    extracted_urls: list[str] | None = None,
+    extracted_url_candidates: list[str] | None = None,
+) -> str:
     """
     QR 내용의 유형을 분류한다.
     """
     text = content.strip()
     lower = text.lower()
 
-    if lower.startswith("http://") or lower.startswith("https://"):
+    if (
+        lower.startswith("http://") or lower.startswith("https://")
+    ) and URL_PATTERN.fullmatch(text):
         return "url"
 
     for scheme, qr_type in ACTION_SCHEMES.items():
@@ -118,7 +219,14 @@ def detect_qr_type(content: str) -> str:
         if lower.startswith(scheme):
             return "dangerous_scheme"
 
-    if extract_urls(text):
+    urls = extract_urls(text) if extracted_urls is None else extracted_urls
+    candidates = (
+        extract_url_candidates(text)
+        if extracted_url_candidates is None
+        else extracted_url_candidates
+    )
+
+    if urls or candidates:
         return "text_with_url"
 
     if PHONE_PATTERN.search(text):
@@ -140,8 +248,14 @@ def analyze_non_url_qr(content: str) -> dict:
     decoded_content = decode_repeatedly(original_content)
     lower_decoded = decoded_content.lower()
 
-    qr_type = detect_qr_type(decoded_content)
     extracted_urls = extract_urls(decoded_content)
+    all_url_candidates = extract_url_candidates(decoded_content)
+    extracted_url_candidates = all_url_candidates[:MAX_URL_CANDIDATES]
+    qr_type = detect_qr_type(
+        decoded_content,
+        extracted_urls=extracted_urls,
+        extracted_url_candidates=all_url_candidates,
+    )
 
     risk_score = 0
     reasons: list[str] = []
@@ -149,6 +263,8 @@ def analyze_non_url_qr(content: str) -> dict:
     analysis_flags = {
         "decoded_changed": decoded_content != original_content,
         "contains_url": len(extracted_urls) > 0,
+        "contains_url_candidate": len(all_url_candidates) > 0,
+        "url_candidate_count": len(all_url_candidates),
         "contains_phone": bool(PHONE_PATTERN.search(decoded_content)),
         "contains_email": bool(EMAIL_PATTERN.search(decoded_content)),
         "sensitive_keyword_count": 0,
@@ -182,9 +298,13 @@ def analyze_non_url_qr(content: str) -> dict:
         risk_score += 30
         reasons.append("Wi-Fi 연결 정보 QR입니다. 신뢰할 수 없는 네트워크 연결을 주의해야 합니다.")
 
-    if extracted_urls:
+    if extracted_urls or all_url_candidates:
         risk_score += 15
-        reasons.append("일반 텍스트 안에 URL이 포함되어 있습니다. 포함된 URL 분석이 필요합니다.")
+        if extracted_urls:
+            reasons.append("일반 텍스트 안에 URL이 포함되어 있습니다. 포함된 URL 분석이 필요합니다.")
+
+    if all_url_candidates:
+        reasons.append("프로토콜이 명시되지 않은 URL 형태의 문자열이 포함되어 있습니다.")
 
     for keyword in SENSITIVE_KEYWORDS:
         if keyword.lower() in lower_decoded:
@@ -230,6 +350,9 @@ def analyze_non_url_qr(content: str) -> dict:
         "raw_content_preview": mask_sensitive_content(decoded_content),
         "contains_url": len(extracted_urls) > 0,
         "extracted_urls": extracted_urls,
+        "contains_url_candidate": len(all_url_candidates) > 0,
+        "extracted_url_candidates": extracted_url_candidates,
+        "candidate_url_count": len(all_url_candidates),
         "url": first_url,
         "domain": domain,
         "risk_score": risk_score,
@@ -242,5 +365,6 @@ def analyze_non_url_qr(content: str) -> dict:
             "decoded_length": len(decoded_content),
             "decoded_changed": decoded_content != original_content,
             "qr_type": qr_type,
+            "candidate_url_count": len(all_url_candidates),
         },
     }
