@@ -7,10 +7,11 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app import main
+from app.constants import RULESET_VERSION
 from app.schemas import QRAnalyzeRequest, QRAnalyzeResponse, ScanRequest, ScanResponse
 from app.services import database, qr_analyzer, url_cache
 from app.services.qr_analyzer import analyze_non_url_qr
-from app.services.scanner import analyze_url
+from app.services.scanner import analyze_url, analyze_url_with_vt_result
 
 
 def make_url_result(url: str) -> dict:
@@ -25,7 +26,7 @@ def make_url_result(url: str) -> dict:
         "vt_score_delta": 0,
         "final_score": 10,
         "risk_score": 10,
-        "ruleset_version": "1.0",
+        "ruleset_version": RULESET_VERSION,
         "status": "safe",
         "message": "현재 기준으로는 비교적 안전한 URL입니다.",
         "reasons": ["특별한 위험 요소가 발견되지 않았습니다."],
@@ -189,7 +190,7 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
         self.assertEqual(result["risk_score"], result["final_score"])
         self.assertEqual(result["local_score"], 10)
         self.assertEqual(result["vt_score_delta"], 0)
-        self.assertEqual(result["ruleset_version"], "1.0")
+        self.assertEqual(result["ruleset_version"], RULESET_VERSION)
 
     def test_http_url_keeps_existing_score_policy(self):
         with patch(
@@ -203,6 +204,147 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
         self.assertEqual(result["vt_score_delta"], 0)
         self.assertEqual(result["final_score"], 30)
         self.assertEqual(result["status"], "warning")
+
+    def test_normal_url_has_no_new_structural_signals(self):
+        result = analyze_url_with_vt_result(
+            "https://example.com",
+            {"enabled": False, "available": False},
+        )
+
+        flags = result["analysis_flags"]
+        self.assertEqual(result["local_score"], 10)
+        self.assertFalse(flags["punycode_hostname"])
+        self.assertFalse(flags["nonstandard_port"])
+        self.assertFalse(flags["excessive_hostname_labels"])
+        self.assertEqual(flags["hostname_label_count"], 2)
+        self.assertIsNone(flags["explicit_port"])
+
+    def test_punycode_hostname_adds_fifteen_points(self):
+        result = analyze_url_with_vt_result(
+            "https://xn--example-xxxx.com",
+            {"enabled": False, "available": False},
+        )
+
+        self.assertEqual(result["local_score"], 25)
+        self.assertTrue(result["analysis_flags"]["punycode_hostname"])
+        self.assertIn(
+            "국제화 도메인(Punycode) 형식이 사용되었습니다.",
+            result["reasons"],
+        )
+
+    def test_punycode_is_detected_in_any_hostname_label(self):
+        result = analyze_url_with_vt_result(
+            "https://login.xn--example-xxxx.com",
+            {"enabled": False, "available": False},
+        )
+
+        self.assertTrue(result["analysis_flags"]["punycode_hostname"])
+        self.assertEqual(result["local_score"], 35)
+
+    def test_standard_explicit_ports_do_not_add_points(self):
+        for url, expected_score, expected_port in (
+            ("https://example.com:443", 10, 443),
+            ("http://example.com:80", 30, 80),
+        ):
+            with self.subTest(url=url):
+                result = analyze_url_with_vt_result(
+                    url,
+                    {"enabled": False, "available": False},
+                )
+                self.assertEqual(result["local_score"], expected_score)
+                self.assertFalse(result["analysis_flags"]["nonstandard_port"])
+                self.assertEqual(
+                    result["analysis_flags"]["explicit_port"],
+                    expected_port,
+                )
+
+    def test_nonstandard_ports_add_ten_points(self):
+        for url, expected_score, expected_port in (
+            ("https://example.com:8443", 20, 8443),
+            ("http://example.com:8080", 40, 8080),
+        ):
+            with self.subTest(url=url):
+                result = analyze_url_with_vt_result(
+                    url,
+                    {"enabled": False, "available": False},
+                )
+                self.assertEqual(result["local_score"], expected_score)
+                self.assertTrue(result["analysis_flags"]["nonstandard_port"])
+                self.assertEqual(
+                    result["analysis_flags"]["explicit_port"],
+                    expected_port,
+                )
+
+    def test_hostname_label_threshold_is_five(self):
+        excessive = analyze_url_with_vt_result(
+            "https://secure.login.account.example.com",
+            {"enabled": False, "available": False},
+        )
+        below_threshold = analyze_url_with_vt_result(
+            "https://login.account.example.com",
+            {"enabled": False, "available": False},
+        )
+
+        self.assertEqual(excessive["analysis_flags"]["hostname_label_count"], 5)
+        self.assertTrue(
+            excessive["analysis_flags"]["excessive_hostname_labels"]
+        )
+        self.assertEqual(excessive["local_score"], 50)
+        self.assertEqual(
+            below_threshold["analysis_flags"]["hostname_label_count"],
+            4,
+        )
+        self.assertFalse(
+            below_threshold["analysis_flags"]["excessive_hostname_labels"]
+        )
+        self.assertEqual(below_threshold["local_score"], 30)
+
+    def test_label_and_port_signals_are_independently_added(self):
+        result = analyze_url_with_vt_result(
+            "https://a.b.c.example.com:8443",
+            {"enabled": False, "available": False},
+        )
+
+        self.assertEqual(result["local_score"], 30)
+        self.assertTrue(result["analysis_flags"]["nonstandard_port"])
+        self.assertTrue(
+            result["analysis_flags"]["excessive_hostname_labels"]
+        )
+
+    def test_punycode_and_port_signals_are_independently_added(self):
+        result = analyze_url_with_vt_result(
+            "https://xn--example-xxxx.com:8443",
+            {"enabled": False, "available": False},
+        )
+
+        self.assertEqual(result["local_score"], 35)
+        self.assertTrue(result["analysis_flags"]["punycode_hostname"])
+        self.assertTrue(result["analysis_flags"]["nonstandard_port"])
+
+    def test_ip_host_does_not_receive_hostname_label_score(self):
+        result = analyze_url_with_vt_result(
+            "https://192.168.0.1",
+            {"enabled": False, "available": False},
+        )
+
+        self.assertEqual(result["local_score"], 85)
+        self.assertTrue(result["analysis_flags"]["ip_address_host"])
+        self.assertFalse(
+            result["analysis_flags"]["excessive_hostname_labels"]
+        )
+        self.assertEqual(result["analysis_flags"]["hostname_label_count"], 0)
+
+    def test_trailing_dot_does_not_increase_hostname_label_count(self):
+        result = analyze_url_with_vt_result(
+            "https://example.com.",
+            {"enabled": False, "available": False},
+        )
+
+        self.assertEqual(result["local_score"], 10)
+        self.assertEqual(result["analysis_flags"]["hostname_label_count"], 2)
+        self.assertFalse(
+            result["analysis_flags"]["excessive_hostname_labels"]
+        )
 
     def test_vt_score_components_preserve_existing_clamp(self):
         with (
@@ -290,7 +432,7 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
         self.assertFalse(result["contains_url"])
         self.assertEqual(result["vt_score_delta"], 0)
         self.assertEqual(result["risk_score"], result["final_score"])
-        self.assertEqual(result["ruleset_version"], "1.0")
+        self.assertEqual(result["ruleset_version"], RULESET_VERSION)
 
     def _analyze_embedded_scores(
         self,
@@ -695,13 +837,44 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
         self.assertEqual(len(result["extracted_url_candidates"]), 10)
 
     def test_punycode_candidate_does_not_add_a_new_risk_rule(self):
-        result = analyze_non_url_qr("xn--example-xxxx.com")
+        with (
+            patch("app.main.analyze_url_with_cache") as cache_mock,
+            patch("app.main.save_scan_result", return_value=make_db_result()),
+        ):
+            result = main.analyze_qr(
+                QRAnalyzeRequest(content="xn--example-xxxx.com")
+            )
 
+        cache_mock.assert_not_called()
         self.assertEqual(
             result["extracted_url_candidates"],
             ["xn--example-xxxx.com"],
         )
         self.assertEqual(result["risk_score"], 15)
+        self.assertNotIn("punycode_hostname", result["analysis_flags"])
+
+    def test_embedded_punycode_url_uses_same_url_analyzer_rules(self):
+        with (
+            patch(
+                "app.services.scanner.get_url_report",
+                return_value={"enabled": False, "available": False},
+            ),
+            patch("app.main.save_scan_result", return_value=make_db_result()),
+        ):
+            result = main.analyze_qr(
+                QRAnalyzeRequest(
+                    content="안내: https://xn--example-xxxx.com"
+                )
+            )
+
+        self.assertEqual(result["qr_type"], "text_with_url")
+        self.assertEqual(result["embedded_url_max_score"], 25)
+        self.assertEqual(result["final_score"], 25)
+        self.assertTrue(
+            result["embedded_url_results"][0]["analysis_flags"][
+                "punycode_hostname"
+            ]
+        )
 
     def test_existing_non_url_types_remain_classified(self):
         for content, expected_type in (
@@ -720,6 +893,21 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 400)
         self.assertEqual(raised.exception.detail, "유효하지 않은 HTTP(S) URL입니다.")
         self.assertNotIn("Invalid IPv6", raised.exception.detail)
+
+    def test_malformed_ports_remain_controlled_client_errors(self):
+        for content in (
+            "https://example.com:abc",
+            "https://example.com:99999",
+        ):
+            with self.subTest(content=content):
+                with self.assertRaises(HTTPException) as raised:
+                    main.analyze_qr(QRAnalyzeRequest(content=content))
+
+                self.assertEqual(raised.exception.status_code, 400)
+                self.assertEqual(
+                    raised.exception.detail,
+                    "유효하지 않은 HTTP(S) URL입니다.",
+                )
 
     def test_decode_failure_is_client_error(self):
         with patch("app.main.decode_repeatedly", side_effect=ValueError("internal")):
@@ -892,6 +1080,38 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
         self.assertTrue(result["history_saved"])
         self.assertEqual(result["history_event_type"], "risk_changed")
         self.assertIsNone(result["history_skip_reason"])
+
+    def test_ruleset_reclassification_exposes_saved_history_event(self):
+        analysis_result = make_url_result("https://example.com")
+        analysis_result.update(
+            {
+                "_history_should_save": True,
+                "_history_event_type": "ruleset_reclassified",
+            }
+        )
+        with (
+            patch(
+                "app.main.analyze_url_with_cache",
+                return_value=analysis_result,
+            ),
+            patch(
+                "app.main.save_scan_result",
+                return_value=make_db_result(),
+            ) as db_mock,
+        ):
+            result = main.analyze_qr(
+                QRAnalyzeRequest(content="https://example.com")
+            )
+
+        self.assertEqual(
+            db_mock.call_args.args[0]["history_event_type"],
+            "ruleset_reclassified",
+        )
+        self.assertTrue(result["history_saved"])
+        self.assertEqual(
+            result["history_event_type"],
+            "ruleset_reclassified",
+        )
 
     def test_same_url_three_times_creates_one_history_and_three_scans(self):
         state = {"item": None}
@@ -1123,7 +1343,7 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
                 "vt_score_delta": 0,
                 "final_score": 55,
                 "risk_score": 55,
-                "ruleset_version": "1.0",
+                "ruleset_version": RULESET_VERSION,
             }
         )
         table = CapturingTable()
@@ -1169,7 +1389,7 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
             "vt_score_delta": 0,
             "final_score": 0,
             "risk_score": 0,
-            "ruleset_version": "1.0",
+            "ruleset_version": RULESET_VERSION,
             "analysis_flags": {},
         }
 
@@ -1177,7 +1397,7 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
         self.assertEqual(dashboard_item["qr_type"], "text")
         self.assertFalse(dashboard_item["contains_url"])
         self.assertEqual(dashboard_item["final_score"], 0)
-        self.assertEqual(dashboard_item["ruleset_version"], "1.0")
+        self.assertEqual(dashboard_item["ruleset_version"], RULESET_VERSION)
         self.assertFalse(dashboard_item["cache_hit"])
         self.assertFalse(dashboard_item["cache_revalidated"])
 
@@ -1529,7 +1749,7 @@ class UrlCacheTests(unittest.TestCase):
         cached = make_cache_item(
             "https://example.com",
             checked_at=990,
-            ruleset_version="0.9",
+            ruleset_version="1.0",
         )
         analyzer = Mock(return_value=make_url_result("https://example.com"))
         with (
@@ -1550,6 +1770,7 @@ class UrlCacheTests(unittest.TestCase):
         save_mock.assert_called_once()
         self.assertTrue(result["cache_revalidated"])
         self.assertEqual(result["revalidation_reason"], "ruleset_changed")
+        self.assertEqual(result["ruleset_version"], RULESET_VERSION)
         self.assertFalse(result["_history_should_save"])
 
     def test_stale_cache_revalidates_and_updates_check_time_when_unchanged(self):
@@ -1782,7 +2003,7 @@ class UrlCacheTests(unittest.TestCase):
         cached = make_cache_item(
             "https://example.com",
             checked_at=990,
-            ruleset_version="0.9",
+            ruleset_version="1.0",
         )
         danger = make_vt_url_result(
             "https://example.com",
@@ -1805,14 +2026,85 @@ class UrlCacheTests(unittest.TestCase):
 
         self.assertTrue(result["cache_revalidated"])
         self.assertTrue(result["_history_should_save"])
-        self.assertEqual(result["_history_event_type"], "risk_changed")
+        self.assertEqual(
+            result["_history_event_type"],
+            "ruleset_reclassified",
+        )
+
+    def test_ruleset_change_with_status_change_requests_reclassification(self):
+        cached = make_cache_item(
+            "https://example.com",
+            checked_at=990,
+            ruleset_version="1.0",
+            local_score=55,
+            final_score=55,
+            risk_score=55,
+            status="warning",
+        )
+        current = make_scored_url_result("https://example.com", 55)
+        current["status"] = "danger"
+
+        with (
+            patch.object(
+                url_cache,
+                "get_cached_url_analysis",
+                return_value=cached,
+            ),
+            patch.object(url_cache, "save_cached_url_analysis"),
+        ):
+            result = url_cache.analyze_url_with_cache(
+                "https://example.com",
+                analyzer=Mock(return_value=current),
+                now_epoch=1000,
+            )
+
+        self.assertTrue(result["_history_should_save"])
+        self.assertEqual(
+            result["_history_event_type"],
+            "ruleset_reclassified",
+        )
+
+    def test_ruleset_change_with_new_punycode_score_requests_history(self):
+        url = "https://xn--example-xxxx.com"
+        cached = make_cache_item(
+            url,
+            checked_at=990,
+            ruleset_version="1.0",
+        )
+        current = analyze_url_with_vt_result(
+            url,
+            {"enabled": False, "available": False},
+        )
+
+        with (
+            patch.object(
+                url_cache,
+                "get_cached_url_analysis",
+                return_value=cached,
+            ),
+            patch.object(url_cache, "save_cached_url_analysis") as save_mock,
+        ):
+            result = url_cache.analyze_url_with_cache(
+                url,
+                analyzer=Mock(return_value=current),
+                now_epoch=1000,
+            )
+
+        save_mock.assert_called_once()
+        self.assertEqual(result["revalidation_reason"], "ruleset_changed")
+        self.assertEqual(result["local_score"], 25)
+        self.assertTrue(result["_history_should_save"])
+        self.assertEqual(
+            result["_history_event_type"],
+            "ruleset_reclassified",
+        )
 
     def test_ruleset_change_with_vt_disabled_keeps_historical_vt_risk(self):
         cached_result = make_vt_url_result("https://example.com", malicious=3)
         cached = make_cache_item(
             "https://example.com",
             checked_at=800,
-            ruleset_version="0.9",
+            ruleset_version="1.0",
             **{
                 key: value
                 for key, value in cached_result.items()
@@ -1832,7 +2124,7 @@ class UrlCacheTests(unittest.TestCase):
             )
 
         analyzer.assert_called_once()
-        self.assertEqual(result["ruleset_version"], "1.0")
+        self.assertEqual(result["ruleset_version"], RULESET_VERSION)
         self.assertEqual(result["status"], "danger")
         self.assertEqual(result["final_score"], 80)
         self.assertFalse(result["cache_revalidated"])

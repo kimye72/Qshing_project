@@ -2,7 +2,14 @@ import ipaddress
 import re
 from urllib.parse import unquote, urlparse
 
-from app.constants import RULESET_VERSION
+from app.constants import (
+    EXCESSIVE_HOSTNAME_LABEL_SCORE,
+    EXCESSIVE_HOSTNAME_LABEL_THRESHOLD,
+    NONSTANDARD_PORT_SCORE,
+    PUNYCODE_HOSTNAME_SCORE,
+    RULESET_VERSION,
+    STANDARD_PORT_BY_SCHEME,
+)
 from app.services.virustotal import get_url_report
 
 
@@ -135,6 +142,11 @@ def _get_local_heuristic_score(url: str, domain: str, decoded_url: str) -> tuple
         "suspicious_keyword_count": 0,
         "sql_xss_pattern_count": 0,
         "suspicious_brand_domain": False,
+        "punycode_hostname": False,
+        "nonstandard_port": False,
+        "explicit_port": None,
+        "excessive_hostname_labels": False,
+        "hostname_label_count": 0,
     }
 
     parsed = urlparse(url)
@@ -142,6 +154,8 @@ def _get_local_heuristic_score(url: str, domain: str, decoded_url: str) -> tuple
     original_lower = url.lower()
     scheme = (parsed.scheme or "").lower()
     hostname = (parsed.hostname or domain or "").lower().strip(".")
+    explicit_port = parsed.port
+    flags["explicit_port"] = explicit_port
 
     if scheme in DANGEROUS_SCHEMES or scheme not in ALLOWED_SCHEMES:
         risk_score += 40
@@ -163,15 +177,39 @@ def _get_local_heuristic_score(url: str, domain: str, decoded_url: str) -> tuple
         reasons.append("URL 길이가 길어 실제 목적지를 확인하기 어렵습니다.")
 
     is_ip, is_private_or_local = _is_ip_address(hostname)
+    is_private_hostname = _looks_like_private_hostname(hostname)
     if is_ip:
         risk_score += 25
         flags["ip_address_host"] = True
         reasons.append("도메인 대신 IP 주소를 직접 사용하고 있습니다.")
 
-    if is_private_or_local or _looks_like_private_hostname(hostname):
+    if is_private_or_local or is_private_hostname:
         risk_score += 50
         flags["private_or_local_host"] = True
         reasons.append("localhost 또는 사설/내부망 주소로 보이는 호스트입니다.")
+
+    hostname_labels = hostname.split(".") if hostname else []
+    if any(label.lower().startswith("xn--") for label in hostname_labels):
+        risk_score += PUNYCODE_HOSTNAME_SCORE
+        flags["punycode_hostname"] = True
+        reasons.append("국제화 도메인(Punycode) 형식이 사용되었습니다.")
+
+    standard_port = STANDARD_PORT_BY_SCHEME.get(scheme)
+    if (
+        explicit_port is not None
+        and standard_port is not None
+        and explicit_port != standard_port
+    ):
+        risk_score += NONSTANDARD_PORT_SCORE
+        flags["nonstandard_port"] = True
+        reasons.append("일반적인 HTTP/HTTPS 포트가 아닌 포트가 사용되었습니다.")
+
+    if not is_ip and not is_private_hostname:
+        flags["hostname_label_count"] = len(hostname_labels)
+        if len(hostname_labels) >= EXCESSIVE_HOSTNAME_LABEL_THRESHOLD:
+            risk_score += EXCESSIVE_HOSTNAME_LABEL_SCORE
+            flags["excessive_hostname_labels"] = True
+            reasons.append("호스트명이 여러 단계의 도메인 레이블로 구성되어 있습니다.")
 
     if "@" in parsed.netloc:
         risk_score += 25

@@ -430,13 +430,16 @@ def _cached_history_policy(
     scan_recorded: bool,
     needs_initial_history: bool,
     risk_changed: bool = False,
+    ruleset_changed: bool = False,
 ) -> tuple[bool, str | None]:
     if not scan_recorded:
         return True, "cache_fallback"
     if needs_initial_history:
         return True, "initial_analysis"
     if risk_changed:
-        return True, "risk_changed"
+        return True, (
+            "ruleset_reclassified" if ruleset_changed else "risk_changed"
+        )
     return False, None
 
 
@@ -677,6 +680,7 @@ def analyze_url_with_cache(
             scan_recorded=scan_recorded,
             needs_initial_history=needs_initial_history,
             risk_changed=risk_changed,
+            ruleset_changed=True,
         )
         return _with_context_history_policy(
             _with_cache_metadata(
@@ -714,6 +718,7 @@ def analyze_url_with_cache(
         scan_recorded=scan_recorded,
         needs_initial_history=needs_initial_history,
         risk_changed=risk_changed,
+        ruleset_changed=not ruleset_matches,
     )
     return _with_context_history_policy(
         _with_cache_metadata(
