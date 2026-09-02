@@ -518,8 +518,8 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
         db_mock.assert_called_once()
         self.assertEqual(result["qr_type"], "text_with_url")
         self.assertTrue(result["contains_url"])
-        self.assertEqual(result["risk_score"], 15)
-        self.assertEqual(result["text_score"], 15)
+        self.assertEqual(result["risk_score"], 10)
+        self.assertEqual(result["text_score"], 0)
         self.assertEqual(result["embedded_url_max_score"], 10)
 
     def test_text_score_wins_over_safe_embedded_url(self):
@@ -775,7 +775,7 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
         self.assertTrue(result["contains_url_candidate"])
         self.assertEqual(result["extracted_url_candidates"], ["example.com"])
         self.assertEqual(result["candidate_url_count"], 1)
-        self.assertEqual(result["text_score"], 15)
+        self.assertEqual(result["text_score"], 0)
         self.assertEqual(result["embedded_url_results"], [])
         QRAnalyzeResponse.model_validate(result)
 
@@ -832,7 +832,7 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
         self.assertEqual(cache_mock.call_args.args[0], "https://example.com")
         self.assertEqual(result["extracted_urls"], ["https://example.com"])
         self.assertEqual(result["extracted_url_candidates"], ["example.org"])
-        self.assertEqual(result["text_score"], 15)
+        self.assertEqual(result["text_score"], 0)
 
     def test_email_file_and_ipv4_are_not_candidates(self):
         for content, expected_type in (
@@ -881,7 +881,7 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
             result["extracted_url_candidates"],
             ["xn--example-xxxx.com"],
         )
-        self.assertEqual(result["risk_score"], 15)
+        self.assertEqual(result["risk_score"], 0)
         self.assertNotIn("punycode_hostname", result["analysis_flags"])
 
     def test_embedded_punycode_url_uses_same_url_analyzer_rules(self):
@@ -919,8 +919,8 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
 
     def test_tel_qr_exposes_only_masked_phone_metadata(self):
         for content, expected_masked, expected_score in (
-            ("tel:01012345678", "010****5678", 35),
-            ("TEL:+821012345678", "+8210****5678", 25),
+            ("tel:01012345678", "010****5678", 0),
+            ("TEL:+821012345678", "+8210****5678", 0),
         ):
             with self.subTest(content=content):
                 result = main.ensure_analysis_contract(
@@ -954,10 +954,10 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
             result["social_engineering_categories"],
             ["credential_request"],
         )
-        self.assertEqual(result["risk_score"], 55)
+        self.assertEqual(result["risk_score"], 20)
         self.assertNotIn("01012345678", repr(result))
 
-    def test_sms_uri_categories_do_not_add_duplicate_score(self):
+    def test_sms_uri_categories_use_bounded_v2_score(self):
         result = main.ensure_analysis_contract(
             analyze_non_url_qr(
                 "sms:01012345678?body=긴급 로그인 확인"
@@ -973,7 +973,11 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
             result["analysis_flags"]["social_engineering_category_count"],
             2,
         )
-        self.assertEqual(result["risk_score"], 65)
+        self.assertEqual(result["risk_score"], 45)
+        self.assertEqual(
+            result["analysis_flags"]["combined_signal_rules"],
+            ["URGENCY_WITH_CREDENTIAL_OR_PERSONAL_INFO"],
+        )
 
     def test_social_engineering_categories_cover_each_supported_meaning(self):
         result = analyze_non_url_qr(
@@ -992,6 +996,149 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
             ],
         )
         self.assertEqual(result["social_engineering_category_count"], 6)
+
+    def test_scoring_v2_benign_structured_qrs_remain_safe(self):
+        cases = (
+            ("tel:+821012345678", "phone", 0),
+            ("mailto:hello@example.com?subject=Hello", "email", 0),
+            ("SMSTO:01012345678:오늘 7시에 만나자", "sms", 0),
+            (
+                "sms:01012345678?body=회의가%20늦게%20끝날%20것%20같아",
+                "sms",
+                0,
+            ),
+            ("WIFI:T:WPA;S:HomeWiFi;P:testpassword;;", "wifi", 0),
+            (
+                "mailto:hello@example.com?body=https%3A%2F%2Fexample.com",
+                "email",
+                10,
+            ),
+            (
+                "sms:01012345678?body=https%3A%2F%2Fexample.com",
+                "sms",
+                10,
+            ),
+        )
+
+        for content, qr_type, expected_score in cases:
+            with self.subTest(content=content):
+                with (
+                    patch(
+                        "app.main.analyze_url_with_cache",
+                        side_effect=lambda url, **_: make_url_result(url),
+                    ),
+                    patch(
+                        "app.main.save_scan_result",
+                        return_value=make_db_result(),
+                    ),
+                ):
+                    result = main.analyze_qr(QRAnalyzeRequest(content=content))
+
+                self.assertEqual(result["qr_type"], qr_type)
+                self.assertEqual(result["risk_score"], expected_score)
+                self.assertEqual(result["status"], "safe")
+
+    def test_scoring_v2_combined_social_signals_are_stronger(self):
+        single_payment = analyze_non_url_qr("송금 요청입니다")
+        combined = analyze_non_url_qr("긴급: 지금 송금하세요")
+
+        self.assertEqual(single_payment["risk_score"], 25)
+        self.assertEqual(combined["risk_score"], 55)
+        self.assertGreater(
+            combined["risk_score"],
+            single_payment["risk_score"],
+        )
+        self.assertEqual(combined["status"], "warning")
+        self.assertIn(
+            "URGENCY_WITH_PAYMENT",
+            combined["analysis_flags"]["combined_signal_rules"],
+        )
+
+    def test_scoring_v2_repeated_keywords_do_not_multiply_category_score(self):
+        single = analyze_non_url_qr("로그인 요청")
+        repeated = analyze_non_url_qr("로그인 로그인 비밀번호 보안코드")
+
+        self.assertEqual(single["risk_score"], 20)
+        self.assertEqual(repeated["risk_score"], 20)
+        self.assertEqual(
+            repeated["analysis_flags"]["score_components"][
+                "social_engineering"
+            ],
+            20,
+        )
+
+    def test_scoring_v2_suspicious_sms_uses_social_and_url_evidence(self):
+        url = "https://suspicious.example/account"
+        with (
+            patch(
+                "app.main.analyze_url_with_cache",
+                return_value=make_scored_url_result(url, 80),
+            ),
+            patch("app.main.save_scan_result", return_value=make_db_result()),
+        ):
+            result = main.analyze_qr(
+                QRAnalyzeRequest(
+                    content=(
+                        "SMSTO:01012345678:계정이 정지됩니다. "
+                        f"지금 본인인증하세요 {url}"
+                    )
+                )
+            )
+
+        self.assertEqual(result["qr_type"], "sms")
+        self.assertEqual(result["text_score"], 55)
+        self.assertEqual(result["embedded_url_max_score"], 80)
+        self.assertEqual(result["final_score"], 80)
+        self.assertEqual(result["status"], "danger")
+
+    def test_scoring_v2_suspicious_mail_uses_embedded_url_score(self):
+        url = "https://suspicious.example/login"
+        with (
+            patch(
+                "app.main.analyze_url_with_cache",
+                return_value=make_scored_url_result(url, 55),
+            ),
+            patch("app.main.save_scan_result", return_value=make_db_result()),
+        ):
+            result = main.analyze_qr(
+                QRAnalyzeRequest(
+                    content=f"mailto:user@example.com?body=로그인하세요%20{url}"
+                )
+            )
+
+        self.assertEqual(result["qr_type"], "email")
+        self.assertEqual(result["text_score"], 20)
+        self.assertEqual(result["embedded_url_max_score"], 55)
+        self.assertEqual(result["final_score"], 55)
+        self.assertEqual(result["status"], "warning")
+
+    def test_scoring_v2_long_content_is_only_a_combined_signal(self):
+        benign_long = analyze_non_url_qr("일상적인 안내 " * 40)
+        social_short = analyze_non_url_qr("긴급 로그인 확인")
+        social_long = analyze_non_url_qr(
+            "긴급 로그인 확인 " + ("추가 안내 " * 60)
+        )
+
+        self.assertTrue(benign_long["analysis_flags"]["long_content"])
+        self.assertEqual(benign_long["risk_score"], 0)
+        self.assertEqual(social_short["risk_score"], 45)
+        self.assertEqual(social_long["risk_score"], 50)
+        self.assertIn(
+            "LONG_CONTENT_WITH_MULTI_SOCIAL",
+            social_long["analysis_flags"]["combined_signal_rules"],
+        )
+
+    def test_scoring_v2_dangerous_scheme_remains_strong_evidence(self):
+        result = analyze_non_url_qr("javascript:alert(1)")
+
+        self.assertEqual(result["qr_type"], "dangerous_scheme")
+        self.assertEqual(result["risk_score"], 70)
+        self.assertEqual(result["status"], "danger")
+        self.assertTrue(result["analysis_flags"]["dangerous_scheme"])
+        self.assertEqual(
+            result["analysis_flags"]["score_components"]["dangerous_scheme"],
+            70,
+        )
 
     def test_sms_body_preview_is_limited_to_one_hundred_characters(self):
         body = "가" * 150
@@ -1013,7 +1160,7 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
         self.assertEqual(structured["email_domain"], "example.com")
         self.assertEqual(structured["email_address_masked"], "u***@example.com")
         self.assertEqual(structured["email_subject_preview"], "계정확인")
-        self.assertEqual(result["risk_score"], 30)
+        self.assertEqual(result["risk_score"], 20)
         self.assertIn(
             "credential_request",
             result["social_engineering_categories"],
@@ -1034,7 +1181,7 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
             "credential_request",
             result["social_engineering_categories"],
         )
-        self.assertEqual(result["risk_score"], 40)
+        self.assertEqual(result["risk_score"], 20)
 
     def test_wifi_password_is_redacted_from_api_result(self):
         result = main.ensure_analysis_contract(
@@ -1169,6 +1316,25 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
         )
         self.assertIn("urgency", result["social_engineering_categories"])
 
+    def test_sms_encoded_url_fragment_is_preserved(self):
+        expected_url = "https://example.com/login?a=1#verification"
+        content = (
+            "sms:01012345678?body="
+            "https%3A%2F%2Fexample.com%2Flogin%3Fa%3D1%23verification"
+        )
+        with (
+            patch(
+                "app.main.analyze_url_with_cache",
+                side_effect=lambda url, **_: make_url_result(url),
+            ) as cache_mock,
+            patch("app.main.save_scan_result", return_value=make_db_result()),
+        ):
+            result = main.analyze_qr(QRAnalyzeRequest(content=content))
+
+        cache_mock.assert_called_once()
+        self.assertEqual(cache_mock.call_args.args[0], expected_url)
+        self.assertEqual(result["embedded_url_results"][0]["url"], expected_url)
+
     def test_mailto_encoded_fields_preserve_body_url_query(self):
         expected_url = "https://example.com/reset?token=abc&next=home"
         content = (
@@ -1262,7 +1428,7 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
             )
 
         self.assertEqual(result["qr_type"], "sms")
-        self.assertEqual(result["risk_score"], 45)
+        self.assertEqual(result["risk_score"], 0)
         self.assertEqual(result["embedded_url_count"], 0)
         self.assertEqual(result["embedded_url_results"], [])
         cache_mock.assert_not_called()

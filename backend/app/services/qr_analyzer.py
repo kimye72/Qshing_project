@@ -2,7 +2,16 @@ import re
 from urllib.parse import parse_qs, unquote, urlparse
 
 from app.constants import (
+    DANGEROUS_SCHEME_SCORE,
     MAX_URL_CANDIDATES,
+    NON_URL_SCORING_VERSION,
+    SCORE_IMPERSONATION_WITH_SENSITIVE_REQUEST,
+    SCORE_LONG_CONTENT_WITH_MULTI_SOCIAL,
+    SCORE_MULTI_SOCIAL_WITH_EXPLICIT_URL,
+    SCORE_PRIZE_WITH_PERSONAL_INFO,
+    SCORE_URGENCY_WITH_CREDENTIAL_OR_PERSONAL_INFO,
+    SCORE_URGENCY_WITH_PAYMENT,
+    SOCIAL_ENGINEERING_CATEGORY_SCORES,
     STRUCTURED_TEXT_PREVIEW_MAX_LENGTH,
     WIFI_SSID_PREVIEW_MAX_LENGTH,
 )
@@ -131,6 +140,33 @@ SOCIAL_ENGINEERING_KEYWORDS = {
         "주민번호",
         "생년월일",
         "본인확인",
+        "본인인증",
+    ),
+}
+
+SOCIAL_ENGINEERING_CATEGORY_LABELS = {
+    "credential_request": "인증정보 또는 로그인 요구",
+    "payment_request": "결제 또는 송금 요구",
+    "urgency": "긴급성 또는 이용 제한 강조",
+    "impersonation_support": "기관·관리자·고객지원 사칭 가능 표현",
+    "prize_reward": "당첨 또는 보상 제공 표현",
+    "personal_info_request": "개인정보 또는 본인확인 요구",
+}
+
+COMBINED_SIGNAL_REASONS = {
+    "URGENCY_WITH_CREDENTIAL_OR_PERSONAL_INFO": (
+        "긴급성 표현과 인증 또는 개인정보 요구가 함께 포함되어 있습니다."
+    ),
+    "URGENCY_WITH_PAYMENT": "긴급성 표현과 결제 또는 송금 요구가 함께 포함되어 있습니다.",
+    "IMPERSONATION_WITH_SENSITIVE_REQUEST": (
+        "기관·관리자 사칭 가능 표현과 민감한 행동 요구가 함께 포함되어 있습니다."
+    ),
+    "PRIZE_WITH_PERSONAL_INFO": "보상 제공 표현과 개인정보 요구가 함께 포함되어 있습니다.",
+    "MULTI_SOCIAL_WITH_EXPLICIT_URL": (
+        "여러 사회공학 신호와 명시적인 URL이 함께 포함되어 있습니다."
+    ),
+    "LONG_CONTENT_WITH_MULTI_SOCIAL": (
+        "긴 콘텐츠 안에 여러 사회공학 신호가 함께 포함되어 있습니다."
     ),
 }
 
@@ -436,6 +472,66 @@ def _detect_social_engineering_categories(content: str) -> list[str]:
     ]
 
 
+def _score_social_engineering(
+    categories: list[str],
+    *,
+    has_explicit_url: bool,
+    long_content: bool,
+) -> tuple[int, int, int, list[str]]:
+    category_set = set(categories)
+    category_score = sum(
+        SOCIAL_ENGINEERING_CATEGORY_SCORES.get(category, 0)
+        for category in category_set
+    )
+    combined_score = 0
+    long_content_score = 0
+    triggered_rules: list[str] = []
+    sensitive_requests = {
+        "credential_request",
+        "payment_request",
+        "personal_info_request",
+    }
+
+    if "urgency" in category_set and category_set.intersection(
+        {"credential_request", "personal_info_request"}
+    ):
+        combined_score += SCORE_URGENCY_WITH_CREDENTIAL_OR_PERSONAL_INFO
+        triggered_rules.append("URGENCY_WITH_CREDENTIAL_OR_PERSONAL_INFO")
+
+    if {"urgency", "payment_request"}.issubset(category_set):
+        combined_score += SCORE_URGENCY_WITH_PAYMENT
+        triggered_rules.append("URGENCY_WITH_PAYMENT")
+
+    if "impersonation_support" in category_set and category_set.intersection(
+        sensitive_requests
+    ):
+        combined_score += SCORE_IMPERSONATION_WITH_SENSITIVE_REQUEST
+        triggered_rules.append("IMPERSONATION_WITH_SENSITIVE_REQUEST")
+
+    if {"prize_reward", "personal_info_request"}.issubset(category_set):
+        combined_score += SCORE_PRIZE_WITH_PERSONAL_INFO
+        triggered_rules.append("PRIZE_WITH_PERSONAL_INFO")
+
+    if (
+        has_explicit_url
+        and len(category_set) >= 2
+        and category_set.intersection(sensitive_requests)
+    ):
+        combined_score += SCORE_MULTI_SOCIAL_WITH_EXPLICIT_URL
+        triggered_rules.append("MULTI_SOCIAL_WITH_EXPLICIT_URL")
+
+    if long_content and len(category_set) >= 2:
+        long_content_score = SCORE_LONG_CONTENT_WITH_MULTI_SOCIAL
+        triggered_rules.append("LONG_CONTENT_WITH_MULTI_SOCIAL")
+
+    return (
+        category_score,
+        combined_score,
+        long_content_score,
+        triggered_rules,
+    )
+
+
 def extract_urls(content: str) -> list[str]:
     """
     일반 텍스트 안에 포함된 URL을 추출한다.
@@ -596,6 +692,22 @@ def analyze_non_url_qr(content: str) -> dict:
     social_engineering_categories = _detect_social_engineering_categories(
         public_analysis_content
     )
+    has_explicit_url_context = bool(
+        embedded_body_urls
+        if qr_type in {"sms", "email"}
+        else extracted_urls
+    )
+    long_content = len(decoded_content) >= 300
+    (
+        social_engineering_score,
+        combined_signal_score,
+        long_content_score,
+        combined_signal_rules,
+    ) = _score_social_engineering(
+        social_engineering_categories,
+        has_explicit_url=has_explicit_url_context,
+        long_content=long_content,
+    )
 
     risk_score = 0
     reasons: list[str] = []
@@ -609,7 +721,7 @@ def analyze_non_url_qr(content: str) -> dict:
         "contains_email": bool(EMAIL_PATTERN.search(decoded_content)),
         "sensitive_keyword_count": 0,
         "dangerous_scheme": False,
-        "long_content": len(decoded_content) >= 300,
+        "long_content": long_content,
         "has_structured_phone": bool(
             structured_content and qr_type in {"phone", "phone_text"}
         ),
@@ -621,59 +733,71 @@ def analyze_non_url_qr(content: str) -> dict:
         "social_engineering_category_count": len(
             social_engineering_categories
         ),
+        "non_url_scoring_version": NON_URL_SCORING_VERSION,
+        "score_components": {
+            "dangerous_scheme": 0,
+            "social_engineering": social_engineering_score,
+            "combined_signals": combined_signal_score,
+            "long_content": long_content_score,
+        },
+        "combined_signal_rules": combined_signal_rules,
     }
 
     if decoded_content != original_content:
-        risk_score += 10
         reasons.append("인코딩된 QR 내용이 포함되어 있어 디코딩 후 추가 검사를 수행했습니다.")
 
     for scheme in DANGEROUS_SCHEMES:
         if lower_decoded.startswith(scheme):
-            risk_score += 70
+            risk_score += DANGEROUS_SCHEME_SCORE
             analysis_flags["dangerous_scheme"] = True
+            analysis_flags["score_components"][
+                "dangerous_scheme"
+            ] = DANGEROUS_SCHEME_SCORE
             reasons.append(f"위험한 실행형 스킴이 포함되어 있습니다: {scheme}")
 
     if qr_type == "phone" or qr_type == "phone_text":
-        risk_score += 25
-        reasons.append("전화번호가 포함되어 있습니다. 보이스피싱 유도 가능성이 있습니다.")
+        reasons.append("전화번호 형식의 QR 콘텐츠입니다.")
 
     if qr_type == "sms":
-        risk_score += 35
-        reasons.append("문자 전송 형식의 QR입니다. 자동 문자 전송을 주의해야 합니다.")
+        reasons.append("문자 작성 정보가 포함된 QR입니다.")
 
     if qr_type == "email" or qr_type == "email_text":
-        risk_score += 20
-        reasons.append("이메일 주소가 포함되어 있습니다. 공식 도메인 여부를 확인해야 합니다.")
+        reasons.append("이메일 작성 정보가 포함된 QR입니다.")
 
     if qr_type == "wifi":
-        risk_score += 30
-        reasons.append("Wi-Fi 연결 정보 QR입니다. 신뢰할 수 없는 네트워크 연결을 주의해야 합니다.")
+        reasons.append("Wi-Fi 연결 정보가 포함된 QR입니다.")
 
     if extracted_urls or all_url_candidates:
-        risk_score += 15
         if extracted_urls:
             reasons.append("일반 텍스트 안에 URL이 포함되어 있습니다. 포함된 URL 분석이 필요합니다.")
 
     if all_url_candidates:
         reasons.append("프로토콜이 명시되지 않은 URL 형태의 문자열이 포함되어 있습니다.")
 
-    for keyword in SENSITIVE_KEYWORDS:
-        if keyword.lower() in lower_decoded:
-            risk_score += 10
-            analysis_flags["sensitive_keyword_count"] += 1
-            reasons.append(f"민감정보 또는 피싱 유도 문구 포함: {keyword}")
+    analysis_flags["sensitive_keyword_count"] = sum(
+        keyword.lower() in lower_decoded for keyword in SENSITIVE_KEYWORDS
+    )
+
+    for category in social_engineering_categories:
+        reasons.append(
+            "사회공학 위험 신호가 포함되어 있습니다: "
+            f"{SOCIAL_ENGINEERING_CATEGORY_LABELS[category]}."
+        )
+
+    for rule_id in combined_signal_rules:
+        reasons.append(COMBINED_SIGNAL_REASONS[rule_id])
+
+    risk_score += (
+        social_engineering_score
+        + combined_signal_score
+        + long_content_score
+    )
 
     if PHONE_PATTERN.search(decoded_content):
-        risk_score += 10
         reasons.append("휴대전화 번호 형식이 포함되어 있습니다.")
 
     if EMAIL_PATTERN.search(decoded_content):
-        risk_score += 10
         reasons.append("이메일 주소 형식이 포함되어 있습니다.")
-
-    if len(decoded_content) >= 300:
-        risk_score += 10
-        reasons.append("QR 내용이 비정상적으로 깁니다.")
 
     risk_score = min(risk_score, 100)
 
