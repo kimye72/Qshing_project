@@ -112,6 +112,10 @@ def ensure_analysis_contract(result: dict) -> dict:
     result.setdefault("structured_content", None)
     result.setdefault("social_engineering_categories", [])
     result.setdefault("social_engineering_category_count", 0)
+    result.setdefault("embedded_url_count", 0)
+    result.setdefault("analyzed_embedded_url_count", 0)
+    result.setdefault("embedded_url_max_score", None)
+    result.setdefault("embedded_url_results", [])
     result.setdefault("local_score", risk_score)
     result.setdefault("vt_score_delta", 0)
     result["final_score"] = risk_score
@@ -253,9 +257,14 @@ def _embedded_url_response(result: dict, analysis_url: str) -> dict:
     }
 
 
-def analyze_text_with_embedded_urls(result: dict) -> dict:
-    """Combine existing text risk with up to three distinct embedded URL results."""
-    extracted_urls = list(result.get("extracted_urls") or [])
+def analyze_text_with_embedded_urls(
+    result: dict,
+    *,
+    extracted_urls: list[str] | None = None,
+) -> dict:
+    """Combine a non-URL parent's risk with distinct embedded URL results."""
+    if extracted_urls is None:
+        extracted_urls = list(result.get("extracted_urls") or [])
     unique_urls = list(dict.fromkeys(extracted_urls))
     embedded_results: list[dict] = []
 
@@ -285,10 +294,17 @@ def analyze_text_with_embedded_urls(result: dict) -> dict:
     final_score = max(text_score, embedded_url_max_score or 0)
     status, message = _status_and_message_for_qr(final_score)
 
+    qr_type = result.get("qr_type")
     reasons = list(result.get("reasons") or [])
     if embedded_results:
         pending_reason = "일반 텍스트 안에 URL이 포함되어 있습니다. 포함된 URL 분석이 필요합니다."
-        completed_reason = "일반 텍스트 안에 URL이 포함되어 있어 포함 URL 분석을 수행했습니다."
+        completed_reason = {
+            "sms": "SMS 본문에 URL이 포함되어 있어 포함 URL 분석을 수행했습니다.",
+            "email": "이메일 본문에 URL이 포함되어 있어 포함 URL 분석을 수행했습니다.",
+        }.get(
+            qr_type,
+            "일반 텍스트 안에 URL이 포함되어 있어 포함 URL 분석을 수행했습니다.",
+        )
         reasons = [
             completed_reason if reason == pending_reason else reason
             for reason in reasons
@@ -296,10 +312,14 @@ def analyze_text_with_embedded_urls(result: dict) -> dict:
     high_risk_count = sum(
         item["status"] == "danger" for item in embedded_results
     )
+    risk_source = {
+        "sms": "메시지 본문에 포함된 URL",
+        "email": "이메일 본문에 포함된 URL",
+    }.get(qr_type, "포함된 URL 분석")
     if high_risk_count:
-        reasons.append("포함된 URL 분석에서 높은 위험도가 탐지되었습니다.")
+        reasons.append(f"{risk_source}에서 높은 위험도가 탐지되었습니다.")
     elif embedded_url_max_score is not None and embedded_url_max_score >= 30:
-        reasons.append("포함된 URL 분석에서 주의가 필요한 위험도가 탐지되었습니다.")
+        reasons.append(f"{risk_source}에서 주의가 필요한 위험도가 탐지되었습니다.")
 
     analysis_flags = dict(result.get("analysis_flags") or {})
     analysis_flags.update(
@@ -399,8 +419,14 @@ def analyze_qr(data: QRAnalyzeRequest):
 
     else:
         result = analyze_non_url_qr(content)
+        embedded_body_urls = result.pop("_embedded_body_urls", [])
         if result.get("qr_type") == "text_with_url":
             result = analyze_text_with_embedded_urls(result)
+        elif result.get("qr_type") in {"sms", "email"} and embedded_body_urls:
+            result = analyze_text_with_embedded_urls(
+                result,
+                extracted_urls=embedded_body_urls,
+            )
 
     result = ensure_analysis_contract(result)
     return persist_scan_history(result)

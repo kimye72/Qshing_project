@@ -76,6 +76,37 @@ def make_text_with_url_result(urls: list[str], score: int) -> dict:
     }
 
 
+def make_structured_parent_result(
+    qr_type: str,
+    urls: list[str],
+    score: int,
+) -> dict:
+    status = "danger" if score >= 70 else "warning" if score >= 30 else "safe"
+    return {
+        "qr_type": qr_type,
+        "raw_content_preview": f"{qr_type} preview",
+        "contains_url": bool(urls),
+        "extracted_urls": list(urls),
+        "contains_url_candidate": False,
+        "extracted_url_candidates": [],
+        "candidate_url_count": 0,
+        "structured_content": {},
+        "social_engineering_categories": [],
+        "social_engineering_category_count": 0,
+        "url": urls[0] if urls else None,
+        "domain": "example.com" if urls else None,
+        "risk_score": score,
+        "status": status,
+        "message": f"{qr_type} score {score}",
+        "reasons": [
+            "일반 텍스트 안에 URL이 포함되어 있습니다. 포함된 URL 분석이 필요합니다."
+        ] if urls else [f"{qr_type} content"],
+        "analysis_flags": {"contains_url": bool(urls)},
+        "raw_result": {"qr_type": qr_type},
+        "_embedded_body_urls": list(urls),
+    }
+
+
 def make_db_result() -> dict:
     return {
         "saved": True,
@@ -1059,20 +1090,473 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
                 self.assertEqual(result["qr_type"], expected_type)
                 QRAnalyzeResponse.model_validate(result)
 
-    def test_sms_body_url_is_not_newly_delegated_to_url_analyzer(self):
+    def test_sms_body_url_uses_embedded_url_analyzer(self):
+        with (
+            patch(
+                "app.main.analyze_url_with_cache",
+                side_effect=lambda url, **_: make_url_result(url),
+            ) as cache_mock,
+            patch(
+                "app.main.save_scan_result",
+                return_value=make_db_result(),
+            ) as db_mock,
+        ):
+            result = main.analyze_qr(
+                QRAnalyzeRequest(
+                    content=(
+                        "sms:01012345678?"
+                        "body=로그인하세요%20https://example.com"
+                    )
+                )
+            )
+
+        self.assertEqual(result["qr_type"], "sms")
+        self.assertTrue(result["contains_url"])
+        self.assertEqual(result["embedded_url_count"], 1)
+        self.assertEqual(result["analyzed_embedded_url_count"], 1)
+        cache_mock.assert_called_once()
+        self.assertEqual(cache_mock.call_args.args[0], "https://example.com")
+        self.assertEqual(
+            cache_mock.call_args.kwargs["analysis_context"],
+            "embedded",
+        )
+        db_mock.assert_called_once()
+
+    def test_sms_encoded_body_preserves_embedded_url_query(self):
+        expected_url = "https://example.com/login?a=1&next=admin"
+        content = (
+            "sms:01012345678?"
+            "body=https%3A%2F%2Fexample.com%2Flogin%3F"
+            "a%3D1%26next%3Dadmin"
+        )
+        with (
+            patch(
+                "app.main.analyze_url_with_cache",
+                side_effect=lambda url, **_: make_url_result(url),
+            ) as cache_mock,
+            patch("app.main.save_scan_result", return_value=make_db_result()),
+        ):
+            result = main.analyze_qr(QRAnalyzeRequest(content=content))
+
+        cache_mock.assert_called_once()
+        self.assertEqual(cache_mock.call_args.args[0], expected_url)
+        self.assertEqual(
+            result["structured_content"]["sms_body_preview"],
+            expected_url,
+        )
+        self.assertEqual(result["embedded_url_results"][0]["url"], expected_url)
+
+    def test_sms_encoded_korean_body_preserves_url_query(self):
+        expected_url = "https://example.com/login?a=1&b=2"
+        content = (
+            "sms:?body=%EA%B8%B4%EA%B8%89%20"
+            "https%3A%2F%2Fexample.com%2Flogin%3Fa%3D1%26b%3D2"
+        )
+        with (
+            patch(
+                "app.main.analyze_url_with_cache",
+                side_effect=lambda url, **_: make_url_result(url),
+            ) as cache_mock,
+            patch("app.main.save_scan_result", return_value=make_db_result()),
+        ):
+            result = main.analyze_qr(QRAnalyzeRequest(content=content))
+
+        cache_mock.assert_called_once()
+        self.assertEqual(cache_mock.call_args.args[0], expected_url)
+        self.assertEqual(
+            result["structured_content"]["sms_body_preview"],
+            f"긴급 {expected_url}",
+        )
+        self.assertIn("urgency", result["social_engineering_categories"])
+
+    def test_mailto_encoded_fields_preserve_body_url_query(self):
+        expected_url = "https://example.com/reset?token=abc&next=home"
+        content = (
+            "mailto:user@example.com?"
+            "subject=%EA%B3%84%EC%A0%95%20%ED%99%95%EC%9D%B8&"
+            "body=https%3A%2F%2Fexample.com%2Freset%3F"
+            "token%3Dabc%26next%3Dhome"
+        )
+        with (
+            patch(
+                "app.main.analyze_url_with_cache",
+                side_effect=lambda url, **_: make_url_result(url),
+            ) as cache_mock,
+            patch("app.main.save_scan_result", return_value=make_db_result()),
+        ):
+            result = main.analyze_qr(QRAnalyzeRequest(content=content))
+
+        structured = result["structured_content"]
+        self.assertEqual(structured["email_subject_preview"], "계정 확인")
+        self.assertEqual(structured["email_body_preview"], expected_url)
+        cache_mock.assert_called_once()
+        self.assertEqual(cache_mock.call_args.args[0], expected_url)
+
+    def test_smsto_encoded_body_preserves_embedded_url_query(self):
+        expected_url = "https://example.com/a?x=1&y=2"
+        content = (
+            "SMSTO:01012345678:"
+            "https%3A%2F%2Fexample.com%2Fa%3Fx%3D1%26y%3D2"
+        )
+        with (
+            patch(
+                "app.main.analyze_url_with_cache",
+                side_effect=lambda url, **_: make_url_result(url),
+            ) as cache_mock,
+            patch("app.main.save_scan_result", return_value=make_db_result()),
+        ):
+            result = main.analyze_qr(QRAnalyzeRequest(content=content))
+
+        self.assertEqual(
+            result["structured_content"]["sms_body_preview"],
+            expected_url,
+        )
+        cache_mock.assert_called_once()
+        self.assertEqual(cache_mock.call_args.args[0], expected_url)
+
+    def test_malformed_structured_percent_encoding_does_not_fail(self):
+        for content in (
+            "sms:01012345678?body=%E0%A4%A",
+            "mailto:user@example.com?subject=%ZZ&body=%E0%A4%A",
+            "SMSTO:01012345678:%E0%A4%A",
+        ):
+            with self.subTest(content=content.split(":", 1)[0]):
+                with (
+                    patch("app.main.analyze_url_with_cache") as cache_mock,
+                    patch(
+                        "app.main.save_scan_result",
+                        return_value=make_db_result(),
+                    ),
+                ):
+                    result = main.analyze_qr(QRAnalyzeRequest(content=content))
+
+                self.assertIn(result["qr_type"], {"sms", "email"})
+                cache_mock.assert_not_called()
+                QRAnalyzeResponse.model_validate(result)
+
+    def test_double_encoded_full_url_still_uses_direct_url_path(self):
+        encoded = "https%253A%252F%252Fexample.com"
+        with (
+            patch(
+                "app.main.analyze_url_with_cache",
+                side_effect=lambda url, **_: make_url_result(url),
+            ) as cache_mock,
+            patch("app.main.save_scan_result", return_value=make_db_result()),
+        ):
+            result = main.analyze_qr(QRAnalyzeRequest(content=encoded))
+
+        self.assertEqual(result["qr_type"], "url")
+        cache_mock.assert_called_once()
+        self.assertEqual(cache_mock.call_args.args[0], "https://example.com")
+
+    def test_sms_without_body_url_does_not_call_url_analyzer(self):
+        with (
+            patch("app.main.analyze_url_with_cache") as cache_mock,
+            patch(
+                "app.main.save_scan_result",
+                return_value=make_db_result(),
+            ) as db_mock,
+        ):
+            result = main.analyze_qr(
+                QRAnalyzeRequest(content="SMSTO:01012345678:안녕하세요")
+            )
+
+        self.assertEqual(result["qr_type"], "sms")
+        self.assertEqual(result["risk_score"], 45)
+        self.assertEqual(result["embedded_url_count"], 0)
+        self.assertEqual(result["embedded_url_results"], [])
+        cache_mock.assert_not_called()
+        db_mock.assert_called_once()
+
+    def test_sms_parent_score_and_embedded_score_use_max(self):
+        url = "https://example.com"
+        cases = ((55, 10, 55, "warning"), (35, 80, 80, "danger"))
+
+        for parent_score, url_score, expected, status in cases:
+            with self.subTest(parent_score=parent_score, url_score=url_score):
+                with (
+                    patch(
+                        "app.main.analyze_non_url_qr",
+                        return_value=make_structured_parent_result(
+                            "sms", [url], parent_score
+                        ),
+                    ),
+                    patch(
+                        "app.main.analyze_url_with_cache",
+                        return_value=make_scored_url_result(url, url_score),
+                    ) as cache_mock,
+                    patch(
+                        "app.main.save_scan_result",
+                        return_value=make_db_result(),
+                    ) as db_mock,
+                ):
+                    result = main.analyze_qr(
+                        QRAnalyzeRequest(content=f"SMSTO:01012345678:{url}")
+                    )
+
+                self.assertEqual(result["local_score"], parent_score)
+                self.assertEqual(result["vt_score_delta"], 0)
+                self.assertEqual(result["embedded_url_max_score"], url_score)
+                self.assertEqual(result["final_score"], expected)
+                self.assertEqual(result["risk_score"], expected)
+                self.assertEqual(result["status"], status)
+                cache_mock.assert_called_once()
+                db_mock.assert_called_once()
+
+    def test_mail_body_url_is_analyzed_but_subject_and_address_are_not(self):
+        body_url = "https://body.example/login"
+        content = (
+            "mailto:user@example.com?"
+            "subject=https://subject.example/ignore&"
+            f"body={body_url}"
+        )
+        with (
+            patch(
+                "app.main.analyze_url_with_cache",
+                side_effect=lambda url, **_: make_url_result(url),
+            ) as cache_mock,
+            patch(
+                "app.main.save_scan_result",
+                return_value=make_db_result(),
+            ) as db_mock,
+        ):
+            result = main.analyze_qr(QRAnalyzeRequest(content=content))
+
+        self.assertEqual(result["qr_type"], "email")
+        self.assertEqual(result["embedded_url_count"], 1)
+        self.assertEqual(result["embedded_url_results"][0]["url"], body_url)
+        cache_mock.assert_called_once()
+        self.assertEqual(cache_mock.call_args.args[0], body_url)
+        self.assertEqual(
+            cache_mock.call_args.kwargs["analysis_context"],
+            "embedded",
+        )
+        db_mock.assert_called_once()
+
+    def test_email_parent_score_and_embedded_score_use_max(self):
+        url = "https://example.com/login"
+        for parent_score, url_score, expected in ((60, 10, 60), (20, 80, 80)):
+            with self.subTest(parent_score=parent_score, url_score=url_score):
+                with (
+                    patch(
+                        "app.main.analyze_non_url_qr",
+                        return_value=make_structured_parent_result(
+                            "email", [url], parent_score
+                        ),
+                    ),
+                    patch(
+                        "app.main.analyze_url_with_cache",
+                        return_value=make_scored_url_result(url, url_score),
+                    ),
+                    patch(
+                        "app.main.save_scan_result",
+                        return_value=make_db_result(),
+                    ),
+                ):
+                    result = main.analyze_qr(
+                        QRAnalyzeRequest(
+                            content=f"mailto:user@example.com?body={url}"
+                        )
+                    )
+
+                self.assertEqual(result["local_score"], parent_score)
+                self.assertEqual(result["vt_score_delta"], 0)
+                self.assertEqual(result["final_score"], expected)
+
+    def test_structured_body_urls_are_deduplicated_and_limited(self):
+        duplicate = "https://duplicate.example/path"
+        with (
+            patch(
+                "app.main.analyze_url_with_cache",
+                side_effect=lambda url, **_: make_url_result(url),
+            ) as cache_mock,
+            patch("app.main.save_scan_result", return_value=make_db_result()),
+        ):
+            duplicate_result = main.analyze_qr(
+                QRAnalyzeRequest(
+                    content=f"SMSTO:01012345678:{duplicate} {duplicate} {duplicate}"
+                )
+            )
+
+        self.assertEqual(duplicate_result["embedded_url_count"], 1)
+        cache_mock.assert_called_once()
+
+        urls = [f"https://site{index}.example/path" for index in range(4)]
+        with (
+            patch(
+                "app.main.analyze_url_with_cache",
+                side_effect=lambda url, **_: make_url_result(url),
+            ) as cache_mock,
+            patch("app.main.save_scan_result", return_value=make_db_result()),
+        ):
+            limited_result = main.analyze_qr(
+                QRAnalyzeRequest(
+                    content="mailto:user@example.com?body=" + " ".join(urls)
+                )
+            )
+
+        self.assertEqual(limited_result["embedded_url_count"], 4)
+        self.assertEqual(limited_result["analyzed_embedded_url_count"], 3)
+        self.assertEqual(cache_mock.call_count, 3)
+
+    def test_structured_embedded_failure_preserves_parent_result(self):
+        with (
+            patch(
+                "app.main.analyze_url_with_cache",
+                side_effect=RuntimeError("internal failure"),
+            ) as cache_mock,
+            patch("app.main.logger.warning") as log_mock,
+            patch(
+                "app.main.save_scan_result",
+                return_value=make_db_result(),
+            ) as db_mock,
+        ):
+            result = main.analyze_qr(
+                QRAnalyzeRequest(
+                    content="SMSTO:01012345678:인증번호 https://example.com"
+                )
+            )
+
+        self.assertEqual(result["qr_type"], "sms")
+        self.assertEqual(result["final_score"], result["text_score"])
+        self.assertEqual(result["analyzed_embedded_url_count"], 0)
+        self.assertNotIn("internal failure", repr(result))
+        cache_mock.assert_called_once()
+        log_mock.assert_called_once()
+        db_mock.assert_called_once()
+
+    def test_sms_schemeless_body_does_not_call_url_analyzer(self):
         with (
             patch("app.main.analyze_url_with_cache") as cache_mock,
             patch("app.main.save_scan_result", return_value=make_db_result()),
         ):
             result = main.analyze_qr(
                 QRAnalyzeRequest(
-                    content="sms:01012345678?body=https://example.com"
+                    content="SMSTO:01012345678:example.com/login"
                 )
             )
 
         self.assertEqual(result["qr_type"], "sms")
-        self.assertTrue(result["contains_url"])
+        self.assertTrue(result["contains_url_candidate"])
+        self.assertEqual(result["embedded_url_count"], 0)
         cache_mock.assert_not_called()
+
+    def test_sms_fresh_embedded_cache_hit_skips_url_analyzer_and_scan_counter(self):
+        url = "https://example.com"
+        cached = make_cache_item(
+            url,
+            checked_at=950,
+            direct_history_initialized=False,
+        )
+        with (
+            patch.object(url_cache, "URL_CACHE_ENABLED", True),
+            patch.object(url_cache, "_utc_epoch_seconds", return_value=1000),
+            patch.object(
+                url_cache,
+                "get_cached_url_analysis",
+                return_value=cached,
+            ),
+            patch.object(url_cache, "record_cached_url_scan") as scan_mock,
+            patch("app.main.analyze_url") as analyzer_mock,
+            patch(
+                "app.main.save_scan_result",
+                return_value=make_db_result(),
+            ) as db_mock,
+        ):
+            result = main.analyze_qr(
+                QRAnalyzeRequest(content=f"SMSTO:01012345678:{url}")
+            )
+
+        analyzer_mock.assert_not_called()
+        scan_mock.assert_not_called()
+        db_mock.assert_called_once()
+        self.assertTrue(result["embedded_url_results"][0]["cache_hit"])
+
+    def test_sms_embedded_cache_miss_saves_only_parent_history(self):
+        url = "https://example.com"
+        with (
+            patch.object(url_cache, "URL_CACHE_ENABLED", True),
+            patch.object(url_cache, "_utc_epoch_seconds", return_value=1000),
+            patch.object(url_cache, "get_cached_url_analysis", return_value=None),
+            patch.object(url_cache, "save_cached_url_analysis") as cache_save_mock,
+            patch("app.main.analyze_url", side_effect=make_url_result) as analyzer_mock,
+            patch(
+                "app.main.save_scan_result",
+                return_value=make_db_result(),
+            ) as db_mock,
+        ):
+            result = main.analyze_qr(
+                QRAnalyzeRequest(content=f"SMSTO:01012345678:{url}")
+            )
+
+        analyzer_mock.assert_called_once_with(url)
+        cache_save_mock.assert_called_once()
+        self.assertFalse(cache_save_mock.call_args.kwargs["increment_scan"])
+        self.assertFalse(
+            cache_save_mock.call_args.kwargs["direct_history_initialized"]
+        )
+        db_mock.assert_called_once()
+        self.assertEqual(db_mock.call_args.args[0]["qr_type"], "sms")
+        self.assertNotIn("_history_should_save", result)
+
+    def test_sms_embedded_cache_then_direct_scan_preserves_initial_history(self):
+        url = "https://example.com"
+        state = {"item": None}
+
+        def get_cached(_url):
+            return dict(state["item"]) if state["item"] else None
+
+        def save_cached(value, _analysis_result, **kwargs):
+            item = make_cache_item(value, checked_at=1000)
+            item["direct_history_initialized"] = kwargs.get(
+                "direct_history_initialized"
+            )
+            state["item"] = item
+
+        def record_scan(_url_hash, *, scanned_at):
+            state["item"]["scan_count"] = state["item"].get("scan_count", 0) + 1
+            state["item"]["last_scanned_at"] = scanned_at
+            state["item"]["direct_history_initialized"] = True
+
+        with (
+            patch.object(url_cache, "URL_CACHE_ENABLED", True),
+            patch.object(url_cache, "_utc_epoch_seconds", return_value=1000),
+            patch.object(
+                url_cache,
+                "get_cached_url_analysis",
+                side_effect=get_cached,
+            ),
+            patch.object(
+                url_cache,
+                "save_cached_url_analysis",
+                side_effect=save_cached,
+            ),
+            patch.object(
+                url_cache,
+                "record_cached_url_scan",
+                side_effect=record_scan,
+            ),
+            patch("app.main.analyze_url", side_effect=make_url_result) as analyzer_mock,
+            patch(
+                "app.main.save_scan_result",
+                return_value=make_db_result(),
+            ) as db_mock,
+        ):
+            parent = main.analyze_qr(
+                QRAnalyzeRequest(content=f"SMSTO:01012345678:{url}")
+            )
+            direct = main.analyze_qr(QRAnalyzeRequest(content=url))
+
+        self.assertEqual(parent["qr_type"], "sms")
+        self.assertEqual(direct["history_event_type"], "initial_analysis")
+        self.assertTrue(direct["history_saved"])
+        analyzer_mock.assert_called_once_with(url)
+        self.assertEqual(db_mock.call_count, 2)
+        self.assertEqual(db_mock.call_args_list[0].args[0]["qr_type"], "sms")
+        self.assertEqual(
+            db_mock.call_args_list[1].args[0]["history_event_type"],
+            "initial_analysis",
+        )
 
     def test_malformed_ipv6_is_client_error_without_internal_detail(self):
         with self.assertRaises(HTTPException) as raised:

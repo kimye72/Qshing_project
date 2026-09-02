@@ -272,7 +272,7 @@ def _parse_wifi_fields(content: str) -> dict[str, str]:
             continue
         key = _unescape_qr_value(key_value[0]).upper()
         if key in {"T", "S", "P", "H"}:
-            fields[key] = _unescape_qr_value(key_value[1])
+            fields[key] = decode_repeatedly(_unescape_qr_value(key_value[1]))
     return fields
 
 
@@ -292,7 +292,11 @@ def _redact_wifi_password(content: str) -> str:
 
 def _first_query_value(query: str, key: str) -> str | None:
     values = parse_qs(query, keep_blank_values=True).get(key)
-    return values[0] if values else None
+    if not values:
+        return None
+    # parse_qs already performs one decoding pass. Decode at most two more
+    # times after the query boundary has been established.
+    return decode_repeatedly(values[0], max_rounds=2)
 
 
 def _parse_phone_content(content: str, qr_type: str) -> dict | None:
@@ -302,25 +306,33 @@ def _parse_phone_content(content: str, qr_type: str) -> dict | None:
         match = PHONE_PATTERN.search(content)
         number = match.group(0) if match else ""
 
+    number = decode_repeatedly(number)
     masked = _mask_phone_number(number)
     return {"phone_number_masked": masked} if masked else None
 
 
-def _parse_sms_content(content: str) -> dict | None:
+def _parse_sms_payload(content: str) -> tuple[str, str | None] | None:
     lower = content.lower()
-    recipient = ""
-    body: str | None = None
 
     if lower.startswith("smsto:"):
         payload = content[6:]
         recipient, separator, body_value = payload.partition(":")
-        body = body_value if separator else None
+        body = decode_repeatedly(body_value) if separator else None
     elif lower.startswith("sms:"):
         payload = content[4:]
         recipient, separator, query = payload.partition("?")
         body = _first_query_value(query, "body") if separator else None
     else:
         return None
+
+    return decode_repeatedly(recipient), body
+
+
+def _parse_sms_content(content: str) -> dict | None:
+    parsed = _parse_sms_payload(content)
+    if parsed is None:
+        return None
+    recipient, body = parsed
 
     metadata: dict = {}
     masked_recipient = _mask_phone_number(recipient.split(",", 1)[0])
@@ -335,13 +347,23 @@ def _parse_sms_content(content: str) -> dict | None:
     return metadata or None
 
 
+def _parse_email_payload(content: str) -> tuple[str, str | None, str | None] | None:
+    if not content.lower().startswith("mailto:"):
+        return None
+
+    payload = content.split(":", 1)[1] if ":" in content else ""
+    address, separator, query = payload.partition("?")
+    return (
+        decode_repeatedly(address.split(",", 1)[0].strip()),
+        _first_query_value(query, "subject") if separator else None,
+        _first_query_value(query, "body") if separator else None,
+    )
+
+
 def _parse_email_content(content: str, qr_type: str) -> dict | None:
-    if qr_type == "email":
-        payload = content.split(":", 1)[1] if ":" in content else ""
-        address, separator, query = payload.partition("?")
-        address = address.split(",", 1)[0].strip()
-        subject = _first_query_value(query, "subject") if separator else None
-        body = _first_query_value(query, "body") if separator else None
+    parsed = _parse_email_payload(content) if qr_type == "email" else None
+    if parsed is not None:
+        address, subject, body = parsed
     else:
         match = EMAIL_PATTERN.search(content)
         address = match.group(0) if match else ""
@@ -419,6 +441,22 @@ def extract_urls(content: str) -> list[str]:
     일반 텍스트 안에 포함된 URL을 추출한다.
     """
     return URL_PATTERN.findall(content)
+
+
+def _extract_structured_body_urls(content: str, qr_type: str) -> list[str]:
+    """Extract explicit HTTP(S) URLs only from an SMS or mail body."""
+    try:
+        if qr_type == "sms":
+            parsed_sms = _parse_sms_payload(content)
+            body = parsed_sms[1] if parsed_sms is not None else None
+        elif qr_type == "email":
+            parsed_email = _parse_email_payload(content)
+            body = parsed_email[2] if parsed_email is not None else None
+        else:
+            return []
+        return extract_urls(body) if body else []
+    except Exception:
+        return []
 
 
 def _spans_overlap(first: tuple[int, int], second: tuple[int, int]) -> bool:
@@ -529,6 +567,13 @@ def analyze_non_url_qr(content: str) -> dict:
     original_content = content.strip()
     decoded_content = decode_repeatedly(original_content)
     lower_decoded = decoded_content.lower()
+    has_explicit_action_scheme = any(
+        original_content.lower().startswith(scheme)
+        for scheme in ACTION_SCHEMES
+    )
+    structured_parse_content = (
+        original_content if has_explicit_action_scheme else decoded_content
+    )
     public_analysis_content = (
         _redact_wifi_password(decoded_content)
         if lower_decoded.startswith("wifi:")
@@ -543,7 +588,11 @@ def analyze_non_url_qr(content: str) -> dict:
         extracted_urls=extracted_urls,
         extracted_url_candidates=all_url_candidates,
     )
-    structured_content = _parse_structured_content(decoded_content, qr_type)
+    structured_content = _parse_structured_content(structured_parse_content, qr_type)
+    embedded_body_urls = _extract_structured_body_urls(
+        structured_parse_content,
+        qr_type,
+    )
     social_engineering_categories = _detect_social_engineering_categories(
         public_analysis_content
     )
@@ -656,6 +705,7 @@ def analyze_non_url_qr(content: str) -> dict:
         "extracted_url_candidates": extracted_url_candidates,
         "candidate_url_count": len(all_url_candidates),
         "structured_content": structured_content,
+        "_embedded_body_urls": embedded_body_urls,
         "social_engineering_categories": social_engineering_categories,
         "social_engineering_category_count": len(
             social_engineering_categories
