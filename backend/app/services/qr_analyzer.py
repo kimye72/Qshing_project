@@ -1,7 +1,11 @@
 import re
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
-from app.constants import MAX_URL_CANDIDATES
+from app.constants import (
+    MAX_URL_CANDIDATES,
+    STRUCTURED_TEXT_PREVIEW_MAX_LENGTH,
+    WIFI_SSID_PREVIEW_MAX_LENGTH,
+)
 
 
 URL_PATTERN = re.compile(
@@ -86,6 +90,50 @@ ACTION_SCHEMES = {
     "wifi:": "wifi",
 }
 
+SOCIAL_ENGINEERING_KEYWORDS = {
+    "credential_request": (
+        "인증번호",
+        "otp",
+        "비밀번호",
+        "로그인",
+        "보안코드",
+        "계정확인",
+    ),
+    "payment_request": (
+        "송금",
+        "입금",
+        "계좌",
+        "결제",
+        "환불",
+        "카드번호",
+    ),
+    "urgency": (
+        "긴급",
+        "즉시",
+        "지금",
+        "제한",
+        "정지",
+    ),
+    "impersonation_support": (
+        "고객센터",
+        "상담원",
+        "관리자",
+        "보안팀",
+    ),
+    "prize_reward": (
+        "당첨",
+        "이벤트",
+        "무료",
+        "쿠폰",
+    ),
+    "personal_info_request": (
+        "개인정보",
+        "주민번호",
+        "생년월일",
+        "본인확인",
+    ),
+}
+
 
 def decode_repeatedly(value: str, max_rounds: int = 3) -> str:
     """
@@ -105,6 +153,25 @@ def decode_repeatedly(value: str, max_rounds: int = 3) -> str:
     return decoded
 
 
+def _mask_phone_number(value: str) -> str | None:
+    compact = re.sub(r"[^0-9+]", "", value.strip())
+    has_country_prefix = compact.startswith("+")
+    digits = compact[1:] if has_country_prefix else compact
+    if not digits.isdigit() or len(digits) < 7:
+        return None
+
+    prefix_length = 4 if has_country_prefix else 3
+    prefix = digits[:prefix_length]
+    return f"{'+' if has_country_prefix else ''}{prefix}****{digits[-4:]}"
+
+
+def _mask_email_address(value: str) -> str | None:
+    local_part, separator, domain = value.strip().rpartition("@")
+    if not separator or not local_part or not domain:
+        return None
+    return f"{local_part[0]}***@{domain.lower()}"
+
+
 def mask_sensitive_content(content: str) -> str:
     """
     화면이나 DB에 저장할 때 민감할 수 있는 정보를 일부 마스킹한다.
@@ -118,10 +185,15 @@ def mask_sensitive_content(content: str) -> str:
         masked,
     )
 
-    # 이메일 일부 마스킹
     masked = re.sub(
-        r"([A-Za-z0-9._%+-]{2})[A-Za-z0-9._%+-]*(@[A-Za-z0-9.-]+\.[A-Za-z]{2,})",
-        r"\1***\2",
+        r"\+82[-\s]?10[-\s]?\d{3,4}[-\s]?\d{4}",
+        lambda match: _mask_phone_number(match.group(0)) or "****",
+        masked,
+    )
+
+    # 이메일 일부 마스킹
+    masked = EMAIL_PATTERN.sub(
+        lambda match: _mask_email_address(match.group(0)) or "***",
         masked,
     )
 
@@ -130,6 +202,216 @@ def mask_sensitive_content(content: str) -> str:
         masked = masked[:200] + "..."
 
     return masked
+
+
+def _limited_sensitive_preview(value: str, max_length: int) -> str:
+    masked = mask_sensitive_content(value)
+    if len(masked) <= max_length:
+        return masked
+    if max_length <= 3:
+        return masked[:max_length]
+    return masked[:max_length - 3] + "..."
+
+
+def _split_unescaped(
+    value: str,
+    separator: str,
+    *,
+    maxsplit: int = -1,
+) -> list[str]:
+    parts: list[str] = []
+    current: list[str] = []
+    escaped = False
+    splits = 0
+
+    for character in value:
+        if escaped:
+            current.extend(("\\", character))
+            escaped = False
+            continue
+        if character == "\\":
+            escaped = True
+            continue
+        if character == separator and (maxsplit < 0 or splits < maxsplit):
+            parts.append("".join(current))
+            current = []
+            splits += 1
+            continue
+        current.append(character)
+
+    if escaped:
+        current.append("\\")
+    parts.append("".join(current))
+    return parts
+
+
+def _unescape_qr_value(value: str) -> str:
+    unescaped: list[str] = []
+    escaped = False
+    for character in value:
+        if escaped:
+            unescaped.append(character)
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        else:
+            unescaped.append(character)
+    if escaped:
+        unescaped.append("\\")
+    return "".join(unescaped)
+
+
+def _parse_wifi_fields(content: str) -> dict[str, str]:
+    if not content.lower().startswith("wifi:"):
+        return {}
+
+    fields: dict[str, str] = {}
+    for field in _split_unescaped(content[5:], ";"):
+        key_value = _split_unescaped(field, ":", maxsplit=1)
+        if len(key_value) != 2:
+            continue
+        key = _unescape_qr_value(key_value[0]).upper()
+        if key in {"T", "S", "P", "H"}:
+            fields[key] = _unescape_qr_value(key_value[1])
+    return fields
+
+
+def _redact_wifi_password(content: str) -> str:
+    if not content.lower().startswith("wifi:"):
+        return content
+
+    redacted_fields: list[str] = []
+    for field in _split_unescaped(content[5:], ";"):
+        key_value = _split_unescaped(field, ":", maxsplit=1)
+        if len(key_value) == 2 and _unescape_qr_value(key_value[0]).upper() == "P":
+            redacted_fields.append(f"{key_value[0]}:****")
+        else:
+            redacted_fields.append(field)
+    return content[:5] + ";".join(redacted_fields)
+
+
+def _first_query_value(query: str, key: str) -> str | None:
+    values = parse_qs(query, keep_blank_values=True).get(key)
+    return values[0] if values else None
+
+
+def _parse_phone_content(content: str, qr_type: str) -> dict | None:
+    if qr_type == "phone":
+        number = content.split(":", 1)[1] if ":" in content else ""
+    else:
+        match = PHONE_PATTERN.search(content)
+        number = match.group(0) if match else ""
+
+    masked = _mask_phone_number(number)
+    return {"phone_number_masked": masked} if masked else None
+
+
+def _parse_sms_content(content: str) -> dict | None:
+    lower = content.lower()
+    recipient = ""
+    body: str | None = None
+
+    if lower.startswith("smsto:"):
+        payload = content[6:]
+        recipient, separator, body_value = payload.partition(":")
+        body = body_value if separator else None
+    elif lower.startswith("sms:"):
+        payload = content[4:]
+        recipient, separator, query = payload.partition("?")
+        body = _first_query_value(query, "body") if separator else None
+    else:
+        return None
+
+    metadata: dict = {}
+    masked_recipient = _mask_phone_number(recipient.split(",", 1)[0])
+    if masked_recipient:
+        metadata["sms_recipient_masked"] = masked_recipient
+    if body is not None:
+        metadata["sms_body_preview"] = _limited_sensitive_preview(
+            body,
+            STRUCTURED_TEXT_PREVIEW_MAX_LENGTH,
+        )
+        metadata["sms_body_length"] = len(body)
+    return metadata or None
+
+
+def _parse_email_content(content: str, qr_type: str) -> dict | None:
+    if qr_type == "email":
+        payload = content.split(":", 1)[1] if ":" in content else ""
+        address, separator, query = payload.partition("?")
+        address = address.split(",", 1)[0].strip()
+        subject = _first_query_value(query, "subject") if separator else None
+        body = _first_query_value(query, "body") if separator else None
+    else:
+        match = EMAIL_PATTERN.search(content)
+        address = match.group(0) if match else ""
+        subject = None
+        body = None
+
+    metadata: dict = {}
+    if EMAIL_PATTERN.fullmatch(address):
+        masked_address = _mask_email_address(address)
+        if masked_address:
+            metadata["email_address_masked"] = masked_address
+        metadata["email_domain"] = address.rsplit("@", 1)[1].lower()
+    if subject is not None:
+        metadata["email_subject_preview"] = _limited_sensitive_preview(
+            subject,
+            STRUCTURED_TEXT_PREVIEW_MAX_LENGTH,
+        )
+    if body is not None:
+        metadata["email_body_preview"] = _limited_sensitive_preview(
+            body,
+            STRUCTURED_TEXT_PREVIEW_MAX_LENGTH,
+        )
+        metadata["email_body_length"] = len(body)
+    return metadata or None
+
+
+def _parse_wifi_content(content: str) -> dict | None:
+    fields = _parse_wifi_fields(content)
+    if not fields:
+        return None
+
+    security_type = fields.get("T")
+    password = fields.get("P", "")
+    metadata: dict = {
+        "wifi_hidden": fields.get("H", "").lower() in {"true", "1", "yes"},
+        "wifi_has_password": bool(password)
+        and (security_type or "").lower() != "nopass",
+    }
+    if security_type:
+        metadata["wifi_security_type"] = security_type[:20]
+    if "S" in fields:
+        metadata["wifi_ssid_preview"] = _limited_sensitive_preview(
+            fields["S"],
+            WIFI_SSID_PREVIEW_MAX_LENGTH,
+        )
+    return metadata
+
+
+def _parse_structured_content(content: str, qr_type: str) -> dict | None:
+    try:
+        if qr_type in {"phone", "phone_text"}:
+            return _parse_phone_content(content, qr_type)
+        if qr_type == "sms":
+            return _parse_sms_content(content)
+        if qr_type in {"email", "email_text"}:
+            return _parse_email_content(content, qr_type)
+        if qr_type == "wifi":
+            return _parse_wifi_content(content)
+    except Exception:
+        return None
+    return None
+
+
+def _detect_social_engineering_categories(content: str) -> list[str]:
+    lower = content.lower()
+    return [
+        category
+        for category, keywords in SOCIAL_ENGINEERING_KEYWORDS.items()
+        if any(keyword.lower() in lower for keyword in keywords)
+    ]
 
 
 def extract_urls(content: str) -> list[str]:
@@ -247,14 +529,23 @@ def analyze_non_url_qr(content: str) -> dict:
     original_content = content.strip()
     decoded_content = decode_repeatedly(original_content)
     lower_decoded = decoded_content.lower()
+    public_analysis_content = (
+        _redact_wifi_password(decoded_content)
+        if lower_decoded.startswith("wifi:")
+        else decoded_content
+    )
 
-    extracted_urls = extract_urls(decoded_content)
-    all_url_candidates = extract_url_candidates(decoded_content)
+    extracted_urls = extract_urls(public_analysis_content)
+    all_url_candidates = extract_url_candidates(public_analysis_content)
     extracted_url_candidates = all_url_candidates[:MAX_URL_CANDIDATES]
     qr_type = detect_qr_type(
         decoded_content,
         extracted_urls=extracted_urls,
         extracted_url_candidates=all_url_candidates,
+    )
+    structured_content = _parse_structured_content(decoded_content, qr_type)
+    social_engineering_categories = _detect_social_engineering_categories(
+        public_analysis_content
     )
 
     risk_score = 0
@@ -270,6 +561,17 @@ def analyze_non_url_qr(content: str) -> dict:
         "sensitive_keyword_count": 0,
         "dangerous_scheme": False,
         "long_content": len(decoded_content) >= 300,
+        "has_structured_phone": bool(
+            structured_content and qr_type in {"phone", "phone_text"}
+        ),
+        "has_structured_sms": bool(structured_content and qr_type == "sms"),
+        "has_structured_email": bool(
+            structured_content and qr_type in {"email", "email_text"}
+        ),
+        "has_structured_wifi": bool(structured_content and qr_type == "wifi"),
+        "social_engineering_category_count": len(
+            social_engineering_categories
+        ),
     }
 
     if decoded_content != original_content:
@@ -347,12 +649,17 @@ def analyze_non_url_qr(content: str) -> dict:
 
     return {
         "qr_type": qr_type,
-        "raw_content_preview": mask_sensitive_content(decoded_content),
+        "raw_content_preview": mask_sensitive_content(public_analysis_content),
         "contains_url": len(extracted_urls) > 0,
         "extracted_urls": extracted_urls,
         "contains_url_candidate": len(all_url_candidates) > 0,
         "extracted_url_candidates": extracted_url_candidates,
         "candidate_url_count": len(all_url_candidates),
+        "structured_content": structured_content,
+        "social_engineering_categories": social_engineering_categories,
+        "social_engineering_category_count": len(
+            social_engineering_categories
+        ),
         "url": first_url,
         "domain": domain,
         "risk_score": risk_score,

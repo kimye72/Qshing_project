@@ -32,6 +32,22 @@ class EmbeddedUrlResult(BaseModel):
     )
 
 
+class StructuredContent(BaseModel):
+    phone_number_masked: Optional[str] = None
+    sms_recipient_masked: Optional[str] = None
+    sms_body_preview: Optional[str] = None
+    sms_body_length: Optional[int] = None
+    email_address_masked: Optional[str] = None
+    email_domain: Optional[str] = None
+    email_subject_preview: Optional[str] = None
+    email_body_preview: Optional[str] = None
+    email_body_length: Optional[int] = None
+    wifi_security_type: Optional[str] = None
+    wifi_ssid_preview: Optional[str] = None
+    wifi_hidden: Optional[bool] = None
+    wifi_has_password: Optional[bool] = None
+
+
 class ScanRequest(BaseModel):
     url: str = Field(
         ...,
@@ -114,6 +130,18 @@ class QRAnalyzeResponse(BaseModel):
     candidate_url_count: int = Field(
         default=0,
         description="중복 제거된 프로토콜 없는 URL 후보 수",
+    )
+    structured_content: Optional[StructuredContent] = Field(
+        default=None,
+        description="민감값을 제외하거나 마스킹한 구조형 QR metadata",
+    )
+    social_engineering_categories: List[str] = Field(
+        default_factory=list,
+        description="탐지된 사회공학 의미 category",
+    )
+    social_engineering_category_count: int = Field(
+        default=0,
+        description="탐지된 사회공학 category 수",
     )
     text_score: Optional[int] = Field(default=None, description="텍스트 자체 위험 점수")
     embedded_url_count: int = Field(default=0, description="중복 제거된 포함 URL 수")

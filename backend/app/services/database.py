@@ -87,6 +87,20 @@ def _make_dashboard_item(item: Dict[str, Any]) -> Dict[str, Any]:
             "candidate_url_count",
             analysis_flags.get("url_candidate_count", 0),
         ),
+        "sms_body_length": safe_item.get("sms_body_length"),
+        "email_domain": safe_item.get("email_domain"),
+        "email_body_length": safe_item.get("email_body_length"),
+        "wifi_security_type": safe_item.get("wifi_security_type"),
+        "wifi_hidden": safe_item.get("wifi_hidden"),
+        "wifi_has_password": safe_item.get("wifi_has_password"),
+        "social_engineering_categories": safe_item.get(
+            "social_engineering_categories",
+            [],
+        ),
+        "social_engineering_category_count": safe_item.get(
+            "social_engineering_category_count",
+            analysis_flags.get("social_engineering_category_count", 0),
+        ),
         "url_count": safe_item.get("url_count"),
         "text_score": safe_item.get("text_score"),
         "embedded_url_count": safe_item.get("embedded_url_count", 0),
@@ -132,6 +146,7 @@ def save_scan_result(result: Dict[str, Any]) -> Dict[str, Any]:
     date = now.date().isoformat()
     expires_at = int((now + timedelta(days=SCAN_RESULT_TTL_DAYS)).timestamp())
 
+    structured_content = result.get("structured_content") or {}
     item = {
         "scan_id": scan_id,
         "created_at": created_at,
@@ -145,6 +160,19 @@ def save_scan_result(result: Dict[str, Any]) -> Dict[str, Any]:
             result.get("contains_url_candidate", False)
         ),
         "candidate_url_count": int(result.get("candidate_url_count", 0) or 0),
+        "sms_body_length": structured_content.get("sms_body_length"),
+        "email_domain": structured_content.get("email_domain"),
+        "email_body_length": structured_content.get("email_body_length"),
+        "wifi_security_type": structured_content.get("wifi_security_type"),
+        "wifi_hidden": structured_content.get("wifi_hidden"),
+        "wifi_has_password": structured_content.get("wifi_has_password"),
+        "social_engineering_categories": result.get(
+            "social_engineering_categories",
+            [],
+        ),
+        "social_engineering_category_count": int(
+            result.get("social_engineering_category_count", 0) or 0
+        ),
         "url_count": len(result.get("extracted_urls") or []),
         "text_score": result.get("text_score"),
         "embedded_url_count": int(result.get("embedded_url_count", 0) or 0),

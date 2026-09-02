@@ -109,6 +109,9 @@ def ensure_analysis_contract(result: dict) -> dict:
     result.setdefault("contains_url_candidate", False)
     result.setdefault("extracted_url_candidates", [])
     result.setdefault("candidate_url_count", 0)
+    result.setdefault("structured_content", None)
+    result.setdefault("social_engineering_categories", [])
+    result.setdefault("social_engineering_category_count", 0)
     result.setdefault("local_score", risk_score)
     result.setdefault("vt_score_delta", 0)
     result["final_score"] = risk_score

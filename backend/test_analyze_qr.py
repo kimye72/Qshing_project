@@ -886,6 +886,194 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
             with self.subTest(content=content):
                 self.assertEqual(analyze_non_url_qr(content)["qr_type"], expected_type)
 
+    def test_tel_qr_exposes_only_masked_phone_metadata(self):
+        for content, expected_masked, expected_score in (
+            ("tel:01012345678", "010****5678", 35),
+            ("TEL:+821012345678", "+8210****5678", 25),
+        ):
+            with self.subTest(content=content):
+                result = main.ensure_analysis_contract(
+                    analyze_non_url_qr(content)
+                )
+                self.assertEqual(result["qr_type"], "phone")
+                self.assertEqual(
+                    result["structured_content"]["phone_number_masked"],
+                    expected_masked,
+                )
+                self.assertEqual(result["risk_score"], expected_score)
+                self.assertTrue(
+                    result["analysis_flags"]["has_structured_phone"]
+                )
+                self.assertNotIn(content.split(":", 1)[1], repr(result))
+                QRAnalyzeResponse.model_validate(result)
+
+    def test_smsto_parses_masked_recipient_body_and_category(self):
+        result = main.ensure_analysis_contract(
+            analyze_non_url_qr(
+                "SMSTO:01012345678:인증번호를 입력하세요"
+            )
+        )
+        structured = result["structured_content"]
+
+        self.assertEqual(result["qr_type"], "sms")
+        self.assertEqual(structured["sms_recipient_masked"], "010****5678")
+        self.assertEqual(structured["sms_body_preview"], "인증번호를 입력하세요")
+        self.assertEqual(structured["sms_body_length"], 11)
+        self.assertEqual(
+            result["social_engineering_categories"],
+            ["credential_request"],
+        )
+        self.assertEqual(result["risk_score"], 55)
+        self.assertNotIn("01012345678", repr(result))
+
+    def test_sms_uri_categories_do_not_add_duplicate_score(self):
+        result = main.ensure_analysis_contract(
+            analyze_non_url_qr(
+                "sms:01012345678?body=긴급 로그인 확인"
+            )
+        )
+
+        self.assertEqual(
+            result["social_engineering_categories"],
+            ["credential_request", "urgency"],
+        )
+        self.assertEqual(result["social_engineering_category_count"], 2)
+        self.assertEqual(
+            result["analysis_flags"]["social_engineering_category_count"],
+            2,
+        )
+        self.assertEqual(result["risk_score"], 65)
+
+    def test_social_engineering_categories_cover_each_supported_meaning(self):
+        result = analyze_non_url_qr(
+            "로그인 후 즉시 송금하세요. 보안팀 안내이며 당첨 상품 수령을 위해 개인정보를 확인합니다."
+        )
+
+        self.assertEqual(
+            result["social_engineering_categories"],
+            [
+                "credential_request",
+                "payment_request",
+                "urgency",
+                "impersonation_support",
+                "prize_reward",
+                "personal_info_request",
+            ],
+        )
+        self.assertEqual(result["social_engineering_category_count"], 6)
+
+    def test_sms_body_preview_is_limited_to_one_hundred_characters(self):
+        body = "가" * 150
+        result = analyze_non_url_qr(f"sms:01012345678?body={body}")
+        structured = result["structured_content"]
+
+        self.assertEqual(structured["sms_body_length"], 150)
+        self.assertLessEqual(len(structured["sms_body_preview"]), 100)
+
+    def test_mailto_parses_domain_masked_address_and_subject(self):
+        result = main.ensure_analysis_contract(
+            analyze_non_url_qr(
+                "mailto:user@example.com?subject=계정확인"
+            )
+        )
+        structured = result["structured_content"]
+
+        self.assertEqual(result["qr_type"], "email")
+        self.assertEqual(structured["email_domain"], "example.com")
+        self.assertEqual(structured["email_address_masked"], "u***@example.com")
+        self.assertEqual(structured["email_subject_preview"], "계정확인")
+        self.assertEqual(result["risk_score"], 30)
+        self.assertIn(
+            "credential_request",
+            result["social_engineering_categories"],
+        )
+        self.assertNotIn("user@example.com", repr(result))
+
+    def test_mail_body_category_does_not_add_duplicate_score(self):
+        result = analyze_non_url_qr(
+            "mailto:user@example.com?body=로그인해주세요"
+        )
+
+        self.assertEqual(result["structured_content"]["email_body_length"], 7)
+        self.assertEqual(
+            result["structured_content"]["email_body_preview"],
+            "로그인해주세요",
+        )
+        self.assertIn(
+            "credential_request",
+            result["social_engineering_categories"],
+        )
+        self.assertEqual(result["risk_score"], 40)
+
+    def test_wifi_password_is_redacted_from_api_result(self):
+        result = main.ensure_analysis_contract(
+            analyze_non_url_qr(
+                "WIFI:T:WPA;S:FreeWifi;P:secret123;;"
+            )
+        )
+        structured = result["structured_content"]
+
+        self.assertEqual(result["qr_type"], "wifi")
+        self.assertEqual(structured["wifi_security_type"], "WPA")
+        self.assertEqual(structured["wifi_ssid_preview"], "FreeWifi")
+        self.assertFalse(structured["wifi_hidden"])
+        self.assertTrue(structured["wifi_has_password"])
+        self.assertTrue(result["analysis_flags"]["has_structured_wifi"])
+        self.assertNotIn("secret123", repr(result))
+        self.assertIn("P:****", result["raw_content_preview"])
+        QRAnalyzeResponse.model_validate(result)
+
+    def test_open_wifi_reports_no_password(self):
+        result = analyze_non_url_qr("WIFI:T:nopass;S:Guest;;")
+
+        self.assertEqual(
+            result["structured_content"]["wifi_security_type"],
+            "nopass",
+        )
+        self.assertFalse(result["structured_content"]["wifi_has_password"])
+
+    def test_wifi_escape_characters_are_parsed_without_password_exposure(self):
+        result = analyze_non_url_qr(
+            r"WIFI:T:WPA;S:Office\;Guest\:5G;P:pa\\ss\;word;H:true;;"
+        )
+        structured = result["structured_content"]
+
+        self.assertEqual(structured["wifi_ssid_preview"], "Office;Guest:5G")
+        self.assertTrue(structured["wifi_hidden"])
+        self.assertTrue(structured["wifi_has_password"])
+        self.assertNotIn("pa\\ss", repr(result))
+        self.assertNotIn("word", result["raw_content_preview"])
+
+    def test_malformed_structured_qr_never_raises(self):
+        for content, expected_type in (
+            ("tel:", "phone"),
+            ("sms:", "sms"),
+            ("mailto:", "email"),
+            ("WIFI:", "wifi"),
+            ("WIFI:T:WPA;S:broken\\", "wifi"),
+        ):
+            with self.subTest(content=content):
+                result = main.ensure_analysis_contract(
+                    analyze_non_url_qr(content)
+                )
+                self.assertEqual(result["qr_type"], expected_type)
+                QRAnalyzeResponse.model_validate(result)
+
+    def test_sms_body_url_is_not_newly_delegated_to_url_analyzer(self):
+        with (
+            patch("app.main.analyze_url_with_cache") as cache_mock,
+            patch("app.main.save_scan_result", return_value=make_db_result()),
+        ):
+            result = main.analyze_qr(
+                QRAnalyzeRequest(
+                    content="sms:01012345678?body=https://example.com"
+                )
+            )
+
+        self.assertEqual(result["qr_type"], "sms")
+        self.assertTrue(result["contains_url"])
+        cache_mock.assert_not_called()
+
     def test_malformed_ipv6_is_client_error_without_internal_detail(self):
         with self.assertRaises(HTTPException) as raised:
             main.analyze_qr(QRAnalyzeRequest(content="http://[::1"))
@@ -1378,6 +1566,67 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
         self.assertTrue(table.item["contains_url_candidate"])
         self.assertEqual(table.item["candidate_url_count"], 1)
         self.assertNotIn("extracted_url_candidates", table.item)
+
+    def test_structured_qr_db_stores_only_non_sensitive_summary(self):
+        class CapturingTable:
+            item = None
+
+            def put_item(self, *, Item):
+                self.item = Item
+
+        cases = (
+            (
+                "tel:01012345678",
+                ("01012345678",),
+                {},
+            ),
+            (
+                "sms:01012345678?body=긴급 로그인 확인",
+                ("01012345678", "긴급 로그인 확인"),
+                {"sms_body_length": 9},
+            ),
+            (
+                "mailto:user@example.com?body=로그인해주세요",
+                ("user@example.com", "로그인해주세요"),
+                {"email_domain": "example.com", "email_body_length": 7},
+            ),
+            (
+                "WIFI:T:WPA;S:PrivateNetwork;P:secret123;H:true;;",
+                ("PrivateNetwork", "secret123"),
+                {
+                    "wifi_security_type": "WPA",
+                    "wifi_hidden": True,
+                    "wifi_has_password": True,
+                },
+            ),
+        )
+
+        for content, forbidden_values, expected_summary in cases:
+            with self.subTest(content=content.split(":", 1)[0]):
+                result = main.ensure_analysis_contract(
+                    analyze_non_url_qr(content)
+                )
+                table = CapturingTable()
+                with (
+                    patch.object(database, "DYNAMODB_ENABLED", True),
+                    patch(
+                        "app.services.database._get_table",
+                        return_value=table,
+                    ),
+                ):
+                    database.save_scan_result(result)
+
+                self.assertNotIn("structured_content", table.item)
+                self.assertNotIn("phone_number_masked", table.item)
+                self.assertNotIn("sms_recipient_masked", table.item)
+                self.assertNotIn("sms_body_preview", table.item)
+                self.assertNotIn("email_address_masked", table.item)
+                self.assertNotIn("email_body_preview", table.item)
+                self.assertNotIn("wifi_ssid_preview", table.item)
+                for forbidden in forbidden_values:
+                    self.assertNotIn(forbidden, repr(table.item))
+                for key, expected in expected_summary.items():
+                    self.assertEqual(table.item[key], expected)
 
     def test_dashboard_preserves_new_metadata(self):
         item = {
