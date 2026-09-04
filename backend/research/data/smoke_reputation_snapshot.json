@@ -1,0 +1,15 @@
+{
+  "version": "smoke-v1",
+  "description": "Synthetic reputation data for evaluator plumbing tests; not VirusTotal evidence.",
+  "entries": {
+    "https://reputation-only.example/landing": {
+      "available": true,
+      "stats": {
+        "malicious": 4,
+        "suspicious": 0,
+        "harmless": 0,
+        "undetected": 60
+      }
+    }
+  }
+}
