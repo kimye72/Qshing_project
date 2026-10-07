@@ -348,6 +348,7 @@ def _parse_phone_content(content: str, qr_type: str) -> dict | None:
 
 
 def _parse_sms_payload(content: str) -> tuple[str, str | None] | None:
+    """Parse query SMS, SMSTO and the SMS colon-message compatibility form."""
     lower = content.lower()
 
     if lower.startswith("smsto:"):
@@ -358,6 +359,11 @@ def _parse_sms_payload(content: str) -> tuple[str, str | None] | None:
         payload = content[4:]
         recipient, separator, query = payload.partition("?")
         body = _first_query_value(query, "body") if separator else None
+        # An explicit empty query body still takes precedence. For the
+        # colon-message compatibility form, split before decoding values.
+        if body is None and ":" in payload:
+            recipient, _, body_value = payload.partition(":")
+            body = decode_repeatedly(body_value)
     else:
         return None
 

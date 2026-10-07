@@ -185,6 +185,106 @@ def make_cache_item(url: str, *, checked_at: int, **updates) -> dict:
     return item
 
 
+class SmsPayloadParsingTests(unittest.TestCase):
+    """Synthetic fixtures using reserved 555-01xx numbers and .invalid URLs."""
+
+    def assert_sms_payload(self, content, recipient, body, urls=()):
+        self.assertEqual(
+            qr_analyzer._parse_sms_payload(content),
+            (recipient, body),
+        )
+        self.assertEqual(
+            qr_analyzer._extract_structured_body_urls(content, "sms"),
+            list(urls),
+        )
+        analysis = analyze_non_url_qr(content)
+        self.assertEqual(analysis["qr_type"], "sms")
+        self.assertEqual(analysis["_embedded_body_urls"], list(urls))
+        structured = analysis["structured_content"]
+        if body is None:
+            self.assertNotIn("sms_body_preview", structured)
+        else:
+            self.assertEqual(structured["sms_body_length"], len(body))
+            self.assertEqual(structured["sms_body_preview"], body)
+
+    def test_colon_message_compatibility(self):
+        content = "SMS:+12125550102:This%20is%20my%20text%20message."
+        self.assert_sms_payload(
+            content, "+12125550102", "This is my text message.",
+        )
+        self.assertEqual(
+            qr_analyzer._parse_sms_content(content)["sms_recipient_masked"],
+            "+1212****0102",
+        )
+
+    def test_colon_message_single_encoded_url(self):
+        url = "https://notice.example.invalid/guide?a=1&b=2"
+        self.assert_sms_payload(
+            "SMS:+12125550103:Read%20https%3A%2F%2Fnotice.example.invalid"
+            "%2Fguide%3Fa%3D1%26b%3D2",
+            "+12125550103", f"Read {url}", (url,),
+        )
+
+    def test_colon_message_double_encoded_url(self):
+        url = "https://notice.example.invalid/guide?a=1&b=2"
+        self.assert_sms_payload(
+            "SMS:+12125550103:https%253A%252F%252Fnotice.example.invalid"
+            "%252Fguide%253Fa%253D1%2526b%253D2",
+            "+12125550103", url, (url,),
+        )
+
+    def test_colon_message_additional_colons(self):
+        for body in ("Reminder%3A%20meeting%20at%207", "Reminder:%20meeting%20at%207"):
+            with self.subTest(body=body):
+                self.assert_sms_payload(
+                    f"SMS:+12125550104:{body}",
+                    "+12125550104", "Reminder: meeting at 7",
+                )
+
+    def test_query_body_priority(self):
+        self.assert_sms_payload(
+            "sms:+12125550105?body=Meet%20at%207", "+12125550105", "Meet at 7",
+        )
+        # Preserve the existing recipient too when both syntaxes are present.
+        self.assert_sms_payload(
+            "sms:+12125550105:ignored?body=Meet%20at%207",
+            "+12125550105:ignored", "Meet at 7",
+        )
+
+    def test_empty_query_body_blocks_colon_fallback(self):
+        for recipient in ("+12125550105", "+12125550105:ignored"):
+            with self.subTest(recipient=recipient):
+                self.assert_sms_payload(
+                    f"sms:{recipient}?body=", recipient, "",
+                )
+
+    def test_smsto_regression(self):
+        self.assert_sms_payload(
+            "SMSTO:+12125550106:Meet%20at%207", "+12125550106", "Meet at 7",
+        )
+
+    def test_recipient_only_regression(self):
+        self.assert_sms_payload("sms:+12125550107", "+12125550107", None)
+
+    def test_colon_message_preserves_unencoded_url_query(self):
+        url = "https://notice.example.invalid/guide?a=1&b=2"
+        self.assert_sms_payload(
+            f"SMS:+12125550108:{url}", "+12125550108", url, (url,),
+        )
+
+    def test_colon_message_decode_depth_and_encoded_boundary(self):
+        # Four encoding layers leave one layer after the existing three passes.
+        self.assert_sms_payload(
+            "SMS:%2B12125550109:%2525253A", "+12125550109", "%3A",
+        )
+        self.assert_sms_payload(
+            "sms:%2B12125550109%3Aignored", "+12125550109:ignored", None,
+        )
+
+    def test_empty_colon_message_body(self):
+        self.assert_sms_payload("SMS:+12125550110:", "+12125550110", "")
+
+
 class AnalyzeQrRoutingTests(unittest.TestCase):
     def setUp(self):
         cache_disabled = patch.object(url_cache, "URL_CACHE_ENABLED", False)
@@ -1268,6 +1368,32 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
             "embedded",
         )
         db_mock.assert_called_once()
+
+    def test_sms_colon_message_url_reaches_embedded_analysis(self):
+        expected_url = "https://notice.example.invalid/guide?a=1&b=2"
+        content = (
+            "SMS:+12125550103:https%3A%2F%2Fnotice.example.invalid"
+            "%2Fguide%3Fa%3D1%26b%3D2"
+        )
+        with (
+            patch(
+                "app.main.analyze_url_with_cache",
+                side_effect=lambda url, **_: make_url_result(url),
+            ) as cache_mock,
+            patch("app.main.save_scan_result", return_value=make_db_result()),
+        ):
+            result = main.analyze_qr(QRAnalyzeRequest(content=content))
+
+        cache_mock.assert_called_once()
+        self.assertEqual(cache_mock.call_args.args[0], expected_url)
+        self.assertEqual(result["qr_type"], "sms")
+        self.assertEqual(result["embedded_url_count"], 1)
+        self.assertEqual(result["analyzed_embedded_url_count"], 1)
+        self.assertEqual(result["embedded_url_results"][0]["url"], expected_url)
+        self.assertEqual(
+            result["structured_content"]["sms_body_preview"], expected_url,
+        )
+        QRAnalyzeResponse.model_validate(result)
 
     def test_sms_encoded_body_preserves_embedded_url_query(self):
         expected_url = "https://example.com/login?a=1&next=admin"

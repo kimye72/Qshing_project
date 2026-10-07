@@ -1,0 +1,6 @@
+# Test dependencies only. Lambda packaging continues to use requirements.txt.
+-r requirements.txt
+# Legacy Starlette TestClient imports httpx; newer versions prefer httpx2.
+# Keep both pinned for the tested compatibility matrix; no optional extras.
+httpx==0.28.1
+httpx2==2.12.0

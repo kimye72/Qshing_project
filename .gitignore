@@ -55,3 +55,11 @@ credentials.*
 credentials.json
 aws_credentials*
 .aws/
+
+# Private research data, evidence, snapshots, releases and result outputs
+/backend/study/
+# Local review archive; may contain historical private context
+/qshing_data_foundation_review.zip
+
+# Research code is maintained privately
+/backend/research/
