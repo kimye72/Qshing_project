@@ -31,6 +31,7 @@ from app.services.qr_analyzer import (
     analyze_non_url_qr, decode_repeatedly, normalize_http_url,
 )
 from app.services.scanner import analyze_url
+from app.services.analysis_budget import request_budget
 from app.services.url_cache import UrlAnalysisUnavailableError, analyze_url_with_cache
 
 
@@ -268,6 +269,7 @@ def _embedded_url_response(result: dict, target: dict) -> dict:
         "analysis_flags": dict(result.get("analysis_flags") or {}),
         "ruleset_version": result.get("ruleset_version", RULESET_VERSION),
         "vt_available": bool(result.get("vt_available", False)),
+        "vt_lookup_status": result.get("vt_lookup_status"),
         "vt_source": result.get("vt_source"),
         "vt_malicious": int(result.get("vt_malicious", 0) or 0),
         "vt_suspicious": int(result.get("vt_suspicious", 0) or 0),
@@ -440,6 +442,7 @@ def root():
     ),
     tags=["Analysis"],
 )
+@request_budget
 def scan_url(data: ScanRequest):
     result = ensure_analysis_contract(
         analyze_url_with_cache(str(data.url), analyzer=analyze_url)
@@ -459,6 +462,7 @@ def scan_url(data: ScanRequest):
     ),
     tags=["Analysis"],
 )
+@request_budget
 def analyze_qr(data: QRAnalyzeRequest):
     content = data.content.strip()
 

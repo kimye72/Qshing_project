@@ -10,6 +10,7 @@ import boto3
 from boto3.dynamodb.conditions import Attr
 from botocore.exceptions import BotoCoreError, ClientError
 from dotenv import load_dotenv
+from app.services.analysis_budget import AnalysisBudgetExceeded, dynamodb_config
 
 load_dotenv()
 
@@ -28,6 +29,7 @@ def _get_table():
     """DynamoDB 테이블 객체를 생성합니다."""
     resource_kwargs = {
         "region_name": AWS_REGION,
+        "config": dynamodb_config(storage=True),
     }
 
     if DYNAMODB_ENDPOINT_URL:
@@ -121,6 +123,7 @@ def _make_dashboard_item(item: Dict[str, Any]) -> Dict[str, Any]:
         "source": safe_item.get("source", DEFAULT_SCAN_SOURCE),
         "history_event_type": safe_item.get("history_event_type"),
         "vt_available": safe_item.get("vt_available", vt.get("available", False)),
+        "vt_lookup_status": safe_item.get("vt_lookup_status", vt.get("lookup_status")),
         "vt_source": safe_item.get("vt_source", vt.get("source")),
         "vt_malicious": safe_item.get("vt_malicious", int(stats.get("malicious", 0) or 0)),
         "vt_suspicious": safe_item.get("vt_suspicious", int(stats.get("suspicious", 0) or 0)),
@@ -193,6 +196,7 @@ def save_scan_result(result: Dict[str, Any]) -> Dict[str, Any]:
         "reasons": result.get("reasons", []),
         "analysis_flags": result.get("analysis_flags", {}),
         "vt_available": bool(result.get("vt_available", False)),
+        "vt_lookup_status": result.get("vt_lookup_status"),
         "vt_source": result.get("vt_source"),
         "vt_malicious": int(result.get("vt_malicious", 0)),
         "vt_suspicious": int(result.get("vt_suspicious", 0)),
@@ -227,7 +231,7 @@ def save_scan_result(result: Dict[str, Any]) -> Dict[str, Any]:
             "date": date,
             "error": None,
         }
-    except (BotoCoreError, ClientError, TypeError, ValueError):
+    except (BotoCoreError, ClientError, TypeError, ValueError, AnalysisBudgetExceeded):
         logger.exception("DynamoDB scan result save failed")
         return {
             "saved": False,

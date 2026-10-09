@@ -310,6 +310,7 @@ def _extract_vt_dashboard_fields(vt_result: dict) -> dict:
     stats = vt_result.get("stats") or {}
     return {
         "vt_available": bool(vt_result.get("available")),
+        "vt_lookup_status": vt_result.get("lookup_status"),
         "vt_source": vt_result.get("source"),
         "vt_malicious": int(stats.get("malicious", 0) or 0),
         "vt_suspicious": int(stats.get("suspicious", 0) or 0),
@@ -363,5 +364,31 @@ def analyze_url_with_vt_result(url: str, vt_result: dict) -> dict:
     }
 
 
+def apply_vt_to_local_result(local_result: dict, vt_result: dict) -> dict:
+    """Combine reputation with already completed local work, without rerunning it."""
+    result = dict(local_result)
+    result["raw_result"] = dict(local_result.get("raw_result") or {})
+    reasons = list(result["reasons"])
+    score_with_vt = _apply_virustotal_score(result["local_score"], reasons, vt_result)
+    final_score = min(score_with_vt, 100)
+    status, message = _make_status_and_message(final_score)
+    result.update(
+        vt_score_delta=score_with_vt - result["local_score"],
+        final_score=final_score, risk_score=final_score, status=status,
+        message=message, reasons=reasons, **_extract_vt_dashboard_fields(vt_result),
+    )
+    result["raw_result"]["virustotal"] = vt_result
+    return result
+
+
 def analyze_url(url: str) -> dict:
-    return analyze_url_with_vt_result(url, get_url_report(url))
+    # Finish local analysis first so a reputation failure cannot erase it.
+    result = analyze_url_with_vt_result(url, {"enabled": False, "available": False})
+    try:
+        vt_result = get_url_report(url)
+    except Exception:
+        vt_result = {
+            "enabled": True, "available": False, "lookup_status": "lookup_failed",
+            "error": "외부 평판 정보를 확인하지 못했습니다.",
+        }
+    return apply_vt_to_local_result(result, vt_result)

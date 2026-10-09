@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 
 from app.constants import RULESET_VERSION
 from app.services import virustotal
+from app.services.analysis_budget import dynamodb_config, ensure_local_analysis_time
 from app.services.database import (
     AWS_REGION,
     DYNAMODB_ENDPOINT_URL,
@@ -19,7 +20,7 @@ from app.services.database import (
 from app.services.scanner import (
     _decode_repeatedly,
     analyze_url,
-    analyze_url_with_vt_result,
+    apply_vt_to_local_result,
 )
 
 
@@ -58,6 +59,7 @@ _CACHE_RESULT_FIELDS = (
     "analysis_flags",
     "ruleset_version",
     "vt_available",
+    "vt_lookup_status",
     "vt_source",
     "vt_malicious",
     "vt_suspicious",
@@ -93,6 +95,7 @@ def _analyze_current_url(
     analyzer: Callable[[str], dict[str, Any]],
 ) -> dict[str, Any]:
     try:
+        ensure_local_analysis_time()
         result = analyzer(url)
         _require_current_ruleset(result)
         return result
@@ -102,7 +105,7 @@ def _analyze_current_url(
 
 
 def _get_cache_table():
-    resource_kwargs = {"region_name": AWS_REGION}
+    resource_kwargs = {"region_name": AWS_REGION, "config": dynamodb_config()}
     if DYNAMODB_ENDPOINT_URL:
         resource_kwargs["endpoint_url"] = DYNAMODB_ENDPOINT_URL
 
@@ -197,6 +200,7 @@ def save_cached_url_analysis(
         "analysis_flags": result.get("analysis_flags", {}),
         "ruleset_version": result["ruleset_version"],
         "vt_available": bool(result.get("vt_available", False)),
+        "vt_lookup_status": result.get("vt_lookup_status"),
         "vt_source": result.get("vt_source"),
         "vt_malicious": int(result.get("vt_malicious", 0) or 0),
         "vt_suspicious": int(result.get("vt_suspicious", 0) or 0),
@@ -355,6 +359,9 @@ def _cache_item_is_usable(item: Any) -> bool:
     # ruleset_changed path; they can never qualify for a cache hit.
     if not isinstance(item, dict) or not _REQUIRED_CACHE_FIELDS.issubset(item):
         return False
+    if item.get("vt_source") == "submitted_analysis":
+        # Older builds treated submission acceptance as an available report.
+        return False
     if not isinstance(item.get("url_hash"), str):
         return False
     if _as_epoch_seconds(item.get("last_checked_at")) is None:
@@ -393,12 +400,31 @@ def _restore_cached_result(url: str, item: dict[str, Any]) -> dict[str, Any]:
         "reasons": list(item.get("reasons") or []),
         "analysis_flags": dict(item.get("analysis_flags") or {}),
         "vt_available": bool(item.get("vt_available", False)),
-        "vt_source": item.get("vt_source"),
+        "vt_lookup_status": "cached" if item.get("vt_available") else item.get("vt_lookup_status"),
+        "vt_source": "cached_report" if item.get("vt_available") else item.get("vt_source"),
         "vt_malicious": int(item.get("vt_malicious", 0) or 0),
         "vt_suspicious": int(item.get("vt_suspicious", 0) or 0),
         "vt_harmless": int(item.get("vt_harmless", 0) or 0),
         "vt_undetected": int(item.get("vt_undetected", 0) or 0),
     }
+
+
+def _with_failed_reputation_lookup(result, lookup_result):
+    result["vt_lookup_status"] = lookup_result.get("vt_lookup_status") or "lookup_failed"
+    if result.get("vt_available") or result.get("vt_score_delta"):
+        # Keep past risk evidence, but an unsuccessful current lookup is not
+        # an available/current report. The app must show the unavailable state.
+        result["vt_available"] = False
+        result["vt_source"] = "cached_report"
+        result["analysis_flags"] = {**result.get("analysis_flags", {}), "historical_reputation_used": True}
+        reason = "이번 외부 평판 재조회는 완료하지 못했습니다. 점수에 사용한 저장된 평판 정보는 최신 상태와 다를 수 있습니다."
+        if reason not in result["reasons"]:
+            result["reasons"] = list(result["reasons"]) + [reason]
+        if result.get("raw_result", {}).get("virustotal"):
+            result["raw_result"]["virustotal"].update(
+                available=False, lookup_status=result["vt_lookup_status"], historical=True,
+            )
+    return result
 
 
 def _with_cache_metadata(
@@ -491,7 +517,8 @@ def _cached_vt_result(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "enabled": True,
         "available": available,
-        "source": item.get("vt_source"),
+        "source": "cached_report",
+        "lookup_status": "cached",
         "stats": {
             "malicious": int(item.get("vt_malicious", 0) or 0),
             "suspicious": int(item.get("vt_suspicious", 0) or 0),
@@ -655,7 +682,9 @@ def analyze_url_with_cache(
         )
         return _with_context_history_policy(
             _with_cache_metadata(
-                _restore_cached_result(url, cached),
+                _with_failed_reputation_lookup(
+                    _restore_cached_result(url, cached), {"vt_lookup_status": "disabled"},
+                ),
                 cache_hit=False,
                 cache_age_seconds=age,
                 cache_revalidated=False,
@@ -677,7 +706,7 @@ def analyze_url_with_cache(
         )
         return _with_context_history_policy(
             _with_cache_metadata(
-                _restore_cached_result(url, cached),
+                _with_failed_reputation_lookup(_restore_cached_result(url, cached), result),
                 cache_hit=False,
                 cache_age_seconds=age,
                 cache_revalidated=False,
@@ -689,10 +718,13 @@ def analyze_url_with_cache(
         )
 
     if not ruleset_matches and not has_current_vt_report and _has_historical_vt_result(cached):
-        result = _analyze_current_url(
-            url,
-            lambda address: analyze_url_with_vt_result(address, _cached_vt_result(cached)),
-        )
+        lookup_result = result
+        try:
+            result = apply_vt_to_local_result(result, _cached_vt_result(cached))
+        except (TypeError, ValueError, OverflowError) as exc:
+            logger.warning("Historical reputation unusable: %s", type(exc).__name__)
+            result = lookup_result
+        result = _with_failed_reputation_lookup(result, lookup_result)
         risk_changed = _risk_changed(cached, result)
         previous_checked_at = _as_epoch_seconds(cached.get("last_checked_at")) or 0
         previous_vt_checked_at = _as_epoch_seconds(cached.get("vt_checked_at"))

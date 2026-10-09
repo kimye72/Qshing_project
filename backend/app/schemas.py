@@ -29,6 +29,7 @@ class EmbeddedUrlResult(EmbeddedUrlTarget):
     analysis_flags: Optional[Dict[str, Any]] = Field(default=None, description="포함 URL 분석 플래그")
     ruleset_version: str = Field(..., description="포함 URL 분석 규칙 버전")
     vt_available: bool = Field(default=False, description="VT 리포트 사용 가능 여부")
+    vt_lookup_status: Optional[str] = Field(default=None, description="평판 조회 상태. 캐시 사용과 이번 조회 성공은 구분")
     vt_source: Optional[str] = Field(default=None, description="VT 결과 출처")
     vt_malicious: int = Field(default=0, description="VT 악성 탐지 수")
     vt_suspicious: int = Field(default=0, description="VT 의심 탐지 수")
@@ -93,6 +94,7 @@ class ScanResponse(BaseModel):
 
     #VirusTotal에서 받는 값
     vt_available: Optional[bool] = Field(default=False, description="리포트 사용 가능 여부")
+    vt_lookup_status: Optional[str] = Field(default=None, description="평판 조회 상태")
     vt_source: Optional[str] = Field(default=None, description="결과 출처")
     vt_malicious: Optional[int] = Field(default=0, description="악성 탐지 수")
     vt_suspicious: Optional[int] = Field(default=0, description="의심 탐지 수")
@@ -187,6 +189,7 @@ class QRAnalyzeResponse(BaseModel):
     raw_result: Optional[Dict[str, Any]] = Field(default=None, description="원본 분석 결과")
 
     vt_available: Optional[bool] = Field(default=False, description="VT 리포트 사용 가능 여부")
+    vt_lookup_status: Optional[str] = Field(default=None, description="평판 조회 상태")
     vt_source: Optional[str] = Field(default=None, description="VT 결과 출처")
     vt_malicious: Optional[int] = Field(default=0, description="VT 악성 탐지 수")
     vt_suspicious: Optional[int] = Field(default=0, description="VT 의심 탐지 수")
