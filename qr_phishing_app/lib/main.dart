@@ -5,6 +5,10 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:mobile_scanner/mobile_scanner.dart';
 
+import 'analysis_result.dart';
+
+part 'analysis_result_view.dart';
+
 void main() {
   runApp(const QrPhishingApp());
 }
@@ -90,7 +94,7 @@ class _ScanPageState extends State<ScanPage> with TickerProviderStateMixin {
   final MobileScannerController _scannerController = MobileScannerController();
 
   bool _isProcessing = false;
-  Map<String, dynamic>? _result = null;
+  AnalysisResult? _result;
   String? _errorMessage;
 
   late final AnimationController _pulseController = AnimationController(
@@ -118,28 +122,8 @@ class _ScanPageState extends State<ScanPage> with TickerProviderStateMixin {
     return 'QR 분석 중 오류가 발생했습니다.';
   }
 
-  Map<String, dynamic> _parseAnalysisResponse(http.Response response) {
-    final decodedBody = utf8.decode(response.bodyBytes);
-    final decodedJson = jsonDecode(decodedBody);
-
-    if (decodedJson is! Map) {
-      throw const FormatException('Analysis response is not an object.');
-    }
-
-    final data = Map<String, dynamic>.from(decodedJson);
-    const validStatuses = {'safe', 'warning', 'danger'};
-
-    if (data['qr_type'] is! String ||
-        data['raw_content_preview'] is! String ||
-        data['risk_score'] is! num ||
-        data['status'] is! String ||
-        !validStatuses.contains(data['status']) ||
-        data['message'] is! String ||
-        data['reasons'] is! List) {
-      throw const FormatException('Analysis response fields are invalid.');
-    }
-
-    return data;
+  AnalysisResult _parseAnalysisResponse(http.Response response) {
+    return AnalysisResult.fromBodyBytes(response.bodyBytes);
   }
 
   // ── 기능 로직 (기존 그대로) ────────────────────────────
@@ -223,43 +207,6 @@ class _ScanPageState extends State<ScanPage> with TickerProviderStateMixin {
     _scannerController.dispose();
     _pulseController.dispose();
     super.dispose();
-  }
-
-  // ── 상태별 색상 / 텍스트 ─────────────────────────────
-  Color _statusColor(String? s) {
-    switch (s) {
-      case 'safe':    return AppColors.safe;
-      case 'warning': return AppColors.warning;
-      case 'danger':  return AppColors.danger;
-      default:        return AppColors.textHint;
-    }
-  }
-
-  Color _statusBg(String? s) {
-    switch (s) {
-      case 'safe':    return AppColors.safeBg;
-      case 'warning': return AppColors.warningBg;
-      case 'danger':  return AppColors.dangerBg;
-      default:        return AppColors.surfaceSub;
-    }
-  }
-
-  String _statusLabel(String? s) {
-    switch (s) {
-      case 'safe':    return '안전';
-      case 'warning': return '주의';
-      case 'danger':  return '위험';
-      default:        return '알 수 없음';
-    }
-  }
-
-  IconData _statusIcon(String? s) {
-    switch (s) {
-      case 'safe':    return Icons.check_circle_rounded;
-      case 'warning': return Icons.warning_rounded;
-      case 'danger':  return Icons.dangerous_rounded;
-      default:        return Icons.help_outline_rounded;
-    }
   }
 
   // ── 빌드 ─────────────────────────────────────────────
@@ -549,211 +496,7 @@ class _ScanPageState extends State<ScanPage> with TickerProviderStateMixin {
 
   // ── 결과 뷰 ──────────────────────────────────────────
   Widget _buildResultView() {
-    final status    = _result?['status'] as String?;
-    final riskScore = _result?['risk_score'];
-    final message   = _result?['message'] as String?;
-    final reasons   = (_result?['reasons'] as List?) ?? [];
-    final qrType    = _result?['qr_type'];
-    final preview   = _result?['raw_content_preview'];
-    final hasVtReport = _result?['vt_available'] == true &&
-        _result?['vt_source'] == 'url_report';
-
-    final color = _statusColor(status);
-    final bg    = _statusBg(status);
-
-    return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-
-          // 상태 배지 + 점수
-          Row(
-            children: [
-              Container(
-                padding: const EdgeInsets.symmetric(
-                    horizontal: 14, vertical: 7),
-                decoration: BoxDecoration(
-                  color: bg,
-                  borderRadius: BorderRadius.circular(20),
-                  border: Border.all(color: color.withOpacity(0.3)),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(_statusIcon(status), size: 16, color: color),
-                    const SizedBox(width: 6),
-                    Text(_statusLabel(status),
-                      style: TextStyle(
-                        fontSize: 14,
-                        fontWeight: FontWeight.w700,
-                        color: color,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const Spacer(),
-              // 점수 카드
-              Container(
-                padding: const EdgeInsets.symmetric(
-                    horizontal: 14, vertical: 7),
-                decoration: BoxDecoration(
-                  color: AppColors.surfaceSub,
-                  borderRadius: BorderRadius.circular(20),
-                  border: Border.all(color: AppColors.border),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const Text('위험 점수',
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: AppColors.textHint,
-                        fontWeight: FontWeight.w500,
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Text('$riskScore',
-                      style: TextStyle(
-                        fontSize: 16,
-                        fontWeight: FontWeight.w700,
-                        color: color,
-                        fontFeatures: const [FontFeature.tabularFigures()],
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ),
-
-          const SizedBox(height: 14),
-
-          // QR 유형 + 내용 미리보기
-          if (qrType != null || preview != null || hasVtReport)
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.all(14),
-              decoration: BoxDecoration(
-                color: AppColors.surfaceSub,
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: AppColors.border),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  if (qrType != null) ...[
-                    Row(children: [
-                      const Icon(Icons.qr_code_rounded,
-                          size: 14, color: AppColors.textHint),
-                      const SizedBox(width: 6),
-                      Text(qrTypeLabel(qrType),
-                        style: const TextStyle(
-                          fontSize: 13,
-                          fontWeight: FontWeight.w600,
-                          color: AppColors.textSec,
-                        ),
-                      ),
-                    ]),
-                  ],
-                  if (qrType != null && preview != null)
-                    const SizedBox(height: 6),
-                  if (preview != null) ...[
-                    Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Icon(Icons.text_snippet_outlined,
-                            size: 14, color: AppColors.textHint),
-                        const SizedBox(width: 6),
-                        Expanded(
-                          child: Text('$preview',
-                            style: const TextStyle(
-                              fontSize: 12,
-                              color: AppColors.textHint,
-                              height: 1.5,
-                            ),
-                            maxLines: 2,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
-                  if (hasVtReport && (qrType != null || preview != null))
-                    const SizedBox(height: 6),
-                  if (hasVtReport)
-                    const Row(
-                      children: [
-                        Icon(Icons.verified_user_outlined,
-                            size: 14, color: AppColors.textHint),
-                        SizedBox(width: 6),
-                        Text('VirusTotal 평판 검사 포함',
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: AppColors.textHint,
-                          ),
-                        ),
-                      ],
-                    ),
-                ],
-              ),
-            ),
-
-          const SizedBox(height: 12),
-
-          // 안내 메시지
-          if (message != null && message.isNotEmpty)
-            Text(message,
-              style: const TextStyle(
-                fontSize: 13,
-                color: AppColors.textSec,
-                height: 1.6,
-              ),
-            ),
-
-          // 판단 사유
-          if (reasons.isNotEmpty) ...[
-            const SizedBox(height: 12),
-            const Text('판단 사유',
-              style: TextStyle(
-                fontSize: 12,
-                fontWeight: FontWeight.w600,
-                color: AppColors.textHint,
-                letterSpacing: 0.5,
-              ),
-            ),
-            const SizedBox(height: 6),
-            ...reasons.map((r) => Padding(
-              padding: const EdgeInsets.only(bottom: 5),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text('→ ',
-                    style: TextStyle(
-                      fontSize: 13,
-                      color: AppColors.textHint,
-                    ),
-                  ),
-                  Expanded(
-                    child: Text('$r',
-                      style: const TextStyle(
-                        fontSize: 13,
-                        color: AppColors.textSec,
-                        height: 1.5,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            )),
-          ],
-
-          const SizedBox(height: 16),
-          _rescanButton(),
-        ],
-      ),
-    );
+    return AnalysisResultView(result: _result!, onRescan: _resetScan);
   }
 
   // ── 다시 스캔 버튼 ────────────────────────────────────
