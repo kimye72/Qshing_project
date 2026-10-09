@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from app import main
 from app.constants import ASSUMED_HTTPS_REASON, EMBEDDED_URL_POLICY_VERSION, RULESET_VERSION
 from app.schemas import QRAnalyzeRequest, QRAnalyzeResponse, ScanRequest, ScanResponse
-from app.services import database, qr_analyzer, url_cache
+from app.services import database, qr_analyzer, scanner, url_cache
 from app.services.qr_analyzer import analyze_non_url_qr
 from app.services.scanner import analyze_url, analyze_url_with_vt_result
 
@@ -183,6 +183,173 @@ def make_cache_item(url: str, *, checked_at: int, **updates) -> dict:
             "direct_history_initialized"
         ]
     return item
+
+
+class UrlBrandAndKeywordTests(unittest.TestCase):
+    def setUp(self):
+        vt_disabled = patch("app.services.scanner.get_url_report", return_value={
+            "enabled": False, "available": False,
+        })
+        vt_disabled.start()
+        self.addCleanup(vt_disabled.stop)
+
+    def test_requested_normal_sites_have_no_brand_impersonation_signal(self):
+        for url, score in (
+            ("https://paypal.com", 10),
+            ("https://google.co.kr", 10),
+            ("https://wooribank.com", 20),
+            ("https://daegu.ac.kr/event/free", 20),
+        ):
+            with self.subTest(url=url):
+                result = analyze_url(url)
+                self.assertEqual(result["local_score"], score)
+                self.assertEqual(result["final_score"], score)
+                self.assertEqual(result["vt_score_delta"], 0)
+                self.assertEqual(result["status"], "safe")
+                self.assertFalse(result["analysis_flags"]["suspicious_brand_domain"])
+
+    def test_official_domain_exception_is_case_insensitive_and_allows_real_children(self):
+        for host in (
+            "paypal.com", "WWW.PAYPAL.COM.", "accounts.paypal.com",
+            "google.co.kr", "www.google.co.kr", "accounts.google.co.kr",
+            "naver.com", "m.naver.com", "kakao.com", "kakaocorp.com", "apple.com",
+        ):
+            with self.subTest(host=host):
+                self.assertFalse(analyze_url("https://" + host)["analysis_flags"]["suspicious_brand_domain"])
+
+    def test_external_brand_hosts_do_not_inherit_official_domain_exceptions(self):
+        for host, score in (
+            ("paypal.com.evil.invalid", 25), ("fakepaypal.com", 25),
+            ("notpaypal.com", 25), ("paypal-com.invalid", 25),
+            ("paypal.invalid", 25), ("google.co.kr.evil.invalid", 35),
+            ("fakegoogle.co.kr", 25), ("google-co-kr.invalid", 25),
+            ("naver.com.evil.invalid", 25),
+        ):
+            with self.subTest(host=host):
+                result = analyze_url("https://" + host)
+                self.assertTrue(result["analysis_flags"]["suspicious_brand_domain"])
+                self.assertEqual(result["local_score"], score)
+
+    def test_generic_pay_and_bank_words_do_not_identify_a_brand(self):
+        for host in ("pay.example.invalid", "payment.example.invalid", "riverbank.invalid", "wooribank.com"):
+            with self.subTest(host=host):
+                result = analyze_url("https://" + host)
+                self.assertFalse(result["analysis_flags"]["suspicious_brand_domain"])
+                self.assertEqual(result["analysis_flags"]["suspicious_keyword_count"], int("bank" in host))
+
+    def test_brand_names_in_path_query_fragment_and_userinfo_are_not_host_brands(self):
+        for url in (
+            "https://example.invalid/paypal/google/apple",
+            "https://example.invalid/?brand=paypal&next=https://google.co.kr",
+            "https://example.invalid/#naver-kakao",
+            "https://paypal.com@example.invalid/",
+            "https://example.invalid/?brand=%70aypal",
+        ):
+            with self.subTest(url=url):
+                self.assertFalse(analyze_url(url)["analysis_flags"]["suspicious_brand_domain"])
+        result = analyze_url("https://paypal.com@example.invalid/")
+        self.assertTrue(result["analysis_flags"]["userinfo_in_url"])
+        self.assertEqual(result["local_score"], 35)
+
+    def test_official_hosts_still_run_other_risk_rules(self):
+        for url, flag, score in (
+            ("http://paypal.com", "non_https", 30),
+            ("https://user@paypal.com", "userinfo_in_url", 35),
+            ("https://paypal.com/login/password", "suspicious_keyword_count", 30),
+            ("https://paypal.com/?q=%3Cscript%3Eonerror%3D", "sql_xss_pattern_count", 35),
+            ("https://paypal.com/?q=%3Cscript%3E", "sql_xss_pattern_count", 25),
+            ("https://google.co.kr:8443", "nonstandard_port", 20),
+            ("https://paypal.com/?q=union%20select", "sql_xss_pattern_count", 35),
+        ):
+            with self.subTest(url=url):
+                result = analyze_url(url)
+                self.assertEqual(result["local_score"], score)
+                self.assertTrue(result["analysis_flags"][flag])
+                self.assertFalse(result["analysis_flags"]["suspicious_brand_domain"])
+
+    def test_reward_and_event_tokens_have_lower_weight_in_all_url_components(self):
+        for url in (
+            "https://event-free.invalid/",
+            "https://example.invalid/event/free",
+            "https://example.invalid/?kind=event&offer=free",
+            "https://example.invalid/#event-free",
+        ):
+            with self.subTest(url=url):
+                result = analyze_url(url)
+                self.assertEqual(result["local_score"], 20)
+                self.assertEqual(result["status"], "safe")
+                self.assertEqual(result["analysis_flags"]["suspicious_keyword_count"], 2)
+                self.assertEqual(result["analysis_flags"]["low_confidence_keyword_count"], 2)
+        self.assertEqual(analyze_url("https://example.invalid/gift/coupon")["local_score"], 20)
+
+    def test_official_paypal_script_pattern_keeps_its_score_reason_and_flag(self):
+        encoded_text = analyze_url("https://paypal.com/?q=%3Ctext%3E")
+        encoded_script = analyze_url("https://paypal.com/?q=%3Cscript%3E")
+        self.assertEqual(encoded_script["final_score"] - encoded_text["final_score"], 10)
+        self.assertEqual(encoded_script["analysis_flags"]["sql_xss_pattern_count"], 1)
+        self.assertTrue(encoded_script["analysis_flags"]["decoded_changed"])
+        self.assertIn("XSS 의심 패턴 포함: script 태그", encoded_script["reasons"])
+        self.assertEqual((encoded_script["final_score"], encoded_script["status"]), (25, "safe"))
+
+    def test_weak_keyword_matches_use_tokens_not_arbitrary_substrings(self):
+        result = analyze_url("https://carefree.invalid/prevent?note=gifted&kind=couponing")
+        self.assertEqual(result["local_score"], 10)
+        self.assertEqual(result["analysis_flags"]["low_confidence_keyword_count"], 0)
+
+    def test_encoded_keywords_are_found_once_without_changing_url_or_host(self):
+        url = "https://example.invalid/%2566ree?kind=%2565vent#free-event"
+        result = analyze_url(url)
+        self.assertEqual(result["url"], url)
+        self.assertEqual(result["domain"], "example.invalid")
+        self.assertEqual(result["local_score"], 25)
+        self.assertEqual(result["analysis_flags"]["low_confidence_keyword_count"], 2)
+
+    def test_credential_and_payment_keyword_weights_are_preserved(self):
+        result = analyze_url("https://example.invalid/login/verify?account=password&bank=wallet")
+        self.assertEqual(result["local_score"], 70)
+        self.assertEqual(result["status"], "danger")
+        self.assertEqual(result["analysis_flags"]["suspicious_keyword_count"], 6)
+        self.assertEqual(result["analysis_flags"]["low_confidence_keyword_count"], 0)
+        self.assertEqual(analyze_url("https://example.invalid/%6Cogin/login")["local_score"], 25)
+
+    def test_external_brand_with_credentials_or_reward_tokens_still_warns(self):
+        for url, score in (
+            ("https://fakepaypal.invalid/login", 35),
+            ("https://paypal.com.evil.invalid/login", 35),
+            ("https://fakepaypal.invalid/event/free", 35),
+            ("http://fakepaypal.invalid/free-gift", 55),
+        ):
+            with self.subTest(url=url):
+                result = analyze_url(url)
+                self.assertEqual(result["local_score"], score)
+                self.assertEqual(result["status"], "warning")
+                self.assertTrue(result["analysis_flags"]["suspicious_brand_domain"])
+
+    def test_weak_lure_only_hosts_can_now_fall_below_warning_threshold(self):
+        # Intentional sensitivity tradeoff: these words alone do not establish
+        # phishing. Do not silently claim every old warning is preserved.
+        result = analyze_url("https://freegift.invalid")
+        self.assertEqual(result["local_score"], 10)
+        self.assertEqual(result["status"], "safe")
+        result = analyze_url("https://example.invalid/free/event/gift/coupon")
+        self.assertEqual(result["local_score"], 30)
+        self.assertEqual(result["status"], "warning")
+
+    def test_direct_and_embedded_api_routes_apply_the_new_local_rules(self):
+        with (
+            patch.object(url_cache, "URL_CACHE_ENABLED", False),
+            patch("app.main.save_scan_result", return_value=make_db_result()),
+        ):
+            client = TestClient(main.app)
+            direct = client.post("/scan", json={"url": "https://daegu.ac.kr/event/free"})
+            self.assertEqual(direct.status_code, 200)
+            self.assertEqual(direct.json()["risk_score"], 20)
+            for content in ("확인: https://daegu.ac.kr/event/free", "확인: daegu.ac.kr/event/free"):
+                response = client.post("/analyze-qr", json={"content": content})
+                self.assertEqual(response.status_code, 200)
+                result = response.json()
+                self.assertEqual(result["risk_score"], 20)
+                self.assertEqual(result["embedded_url_results"][0]["local_score"], 20)
 
 
 class SchemelessEmbeddedUrlTests(unittest.TestCase):
@@ -2821,6 +2988,290 @@ class AdminEndpointSecurityTests(unittest.TestCase):
 
         self.assertEqual(scan_response.status_code, 200)
         self.assertEqual(analyze_response.status_code, 200)
+
+
+class UrlRulesetCacheTests(unittest.TestCase):
+    def setUp(self):
+        settings = (
+            patch.object(url_cache, "URL_CACHE_ENABLED", True),
+            patch.object(url_cache, "URL_CACHE_FRESHNESS_SECONDS", 100),
+            patch.object(url_cache, "_utc_epoch_seconds", return_value=1000),
+            patch.object(url_cache.virustotal, "VIRUSTOTAL_ENABLED", False),
+            patch.object(scanner, "get_url_report", return_value={
+                "enabled": False, "available": False,
+            }),
+            patch.object(url_cache, "record_cached_url_scan"),
+            patch("app.main.save_scan_result", return_value=make_db_result()),
+        )
+        for setting in settings:
+            setting.start()
+            self.addCleanup(setting.stop)
+        self.lookup = patch.object(url_cache, "get_cached_url_analysis", return_value=None)
+        self.cached = self.lookup.start()
+        self.addCleanup(self.lookup.stop)
+        self.write = patch.object(url_cache, "save_cached_url_analysis")
+        self.save = self.write.start()
+        self.addCleanup(self.write.stop)
+
+    @staticmethod
+    def old_wooribank_cache():
+        return make_cache_item(
+            "https://wooribank.com", checked_at=990, domain="wooribank.com",
+            ruleset_version="1.1", local_score=35, final_score=35, risk_score=35,
+            status="warning", analysis_flags={"suspicious_brand_domain": True},
+        )
+
+    def test_old_wooribank_score_is_recalculated_for_both_contexts(self):
+        for context in ("direct", "embedded"):
+            with self.subTest(context=context):
+                cached = self.old_wooribank_cache()
+                self.cached.return_value = cached
+                self.save.reset_mock()
+                analyzer = Mock(wraps=analyze_url)
+                result = url_cache.analyze_url_with_cache(
+                    "https://wooribank.com", analyzer=analyzer,
+                    analysis_context=context,
+                )
+                analyzer.assert_called_once_with("https://wooribank.com")
+                self.assertEqual(result["ruleset_version"], "1.2")
+                self.assertEqual(result["final_score"], 20)
+                self.assertEqual(result["status"], "safe")
+                self.assertFalse(result["cache_hit"])
+                self.assertTrue(result["cache_revalidated"])
+                self.assertEqual(result["revalidation_reason"], "ruleset_changed")
+                self.save.assert_called_once()
+                saved = self.save.call_args.args[1]
+                self.assertEqual((saved["ruleset_version"], saved["final_score"]), ("1.2", 20))
+                self.assertEqual(cached["ruleset_version"], "1.1")
+                self.assertEqual(cached["final_score"], 35)
+
+    def test_current_cache_is_reused_without_calculation(self):
+        current = analyze_url("https://wooribank.com")
+        self.cached.return_value = make_cache_item(
+            "https://wooribank.com", checked_at=990,
+            **{key: current[key] for key in url_cache._CACHE_RESULT_FIELDS},
+        )
+        for context in ("direct", "embedded"):
+            with self.subTest(context=context):
+                analyzer = Mock(side_effect=AssertionError("must reuse cache"))
+                result = url_cache.analyze_url_with_cache(
+                    "https://wooribank.com", analyzer=analyzer,
+                    analysis_context=context,
+                )
+                analyzer.assert_not_called()
+                self.assertTrue(result["cache_hit"])
+                self.assertEqual((result["ruleset_version"], result["final_score"]), ("1.2", 20))
+        self.save.assert_not_called()
+
+    def test_missing_or_invalid_cache_versions_require_calculation(self):
+        for version in (None, "", 1.2):
+            for context in ("direct", "embedded"):
+                with self.subTest(version=version, context=context):
+                    cached = self.old_wooribank_cache()
+                    if version is None:
+                        cached.pop("ruleset_version")
+                    else:
+                        cached["ruleset_version"] = version
+                    self.cached.return_value = cached
+                    analyzer = Mock(wraps=analyze_url)
+                    result = url_cache.analyze_url_with_cache(
+                        "https://wooribank.com", analyzer=analyzer,
+                        analysis_context=context,
+                    )
+                    analyzer.assert_called_once()
+                    self.assertEqual((result["ruleset_version"], result["final_score"]), ("1.2", 20))
+                    self.assertEqual(result["revalidation_reason"], "ruleset_changed")
+
+    def test_recalculation_failure_never_returns_or_relabels_old_cache(self):
+        for missing in (False, True):
+            for context in ("direct", "embedded"):
+                with self.subTest(missing=missing, context=context):
+                    cached = self.old_wooribank_cache()
+                    if missing:
+                        cached.pop("ruleset_version")
+                    original = dict(cached)
+                    self.cached.return_value = cached
+                    self.save.reset_mock()
+                    with self.assertRaises(url_cache.UrlAnalysisUnavailableError) as error:
+                        url_cache.analyze_url_with_cache(
+                            "https://wooribank.com",
+                            analyzer=Mock(side_effect=RuntimeError("secret-key internal hostname")),
+                            analysis_context=context,
+                        )
+                    self.assertNotIn("secret-key", str(error.exception))
+                    self.assertEqual(cached, original)
+                    self.save.assert_not_called()
+
+    def test_unknown_calculation_version_is_rejected_in_every_cache_path(self):
+        for enabled, cached in ((False, None), (True, None), (True, self.old_wooribank_cache())):
+            for version in (None, "1.1"):
+                with self.subTest(enabled=enabled, cache=cached is not None, version=version):
+                    result = make_scored_url_result("https://wooribank.com", 35)
+                    if version is None:
+                        result.pop("ruleset_version")
+                    else:
+                        result["ruleset_version"] = version
+                    self.cached.return_value = cached
+                    self.save.reset_mock()
+                    with patch.object(url_cache, "URL_CACHE_ENABLED", enabled):
+                        with self.assertRaises(url_cache.UrlAnalysisUnavailableError):
+                            url_cache.analyze_url_with_cache(
+                                "https://wooribank.com", analyzer=Mock(return_value=result),
+                            )
+                    self.save.assert_not_called()
+
+    def test_save_and_restore_do_not_invent_current_version(self):
+        # Exercise the real storage method, rather than the mock used elsewhere.
+        self.write.stop()
+        table = Mock()
+        with patch.object(url_cache, "_get_cache_table", return_value=table):
+            for version in (None, "1.1"):
+                result = analyze_url("https://wooribank.com")
+                if version is None:
+                    result.pop("ruleset_version")
+                else:
+                    result["ruleset_version"] = version
+                with self.assertRaises(url_cache.UrlAnalysisUnavailableError):
+                    url_cache.save_cached_url_analysis("https://wooribank.com", result)
+                with self.assertRaises(url_cache.UrlAnalysisUnavailableError):
+                    url_cache._restore_cached_result("https://wooribank.com", result)
+            table.update_item.assert_not_called()
+            url_cache.save_cached_url_analysis(
+                "https://wooribank.com", analyze_url("https://wooribank.com"),
+                previous_item=self.old_wooribank_cache(),
+            )
+        values = table.update_item.call_args.kwargs["ExpressionAttributeValues"]
+        self.assertEqual(values[":ruleset_version"], "1.2")
+        self.assertEqual(values[":final_score"], 20)
+        self.assertEqual(values[":previous_score"], 35)
+        self.assertEqual(values[":previous_status"], "warning")
+
+    def test_cache_write_failure_does_not_relabel_previous_score(self):
+        self.cached.return_value = self.old_wooribank_cache()
+        self.save.side_effect = RuntimeError("write unavailable")
+        analyzer = Mock(wraps=analyze_url)
+        for _ in range(2):
+            result = url_cache.analyze_url_with_cache("https://wooribank.com", analyzer=analyzer)
+            self.assertEqual((result["ruleset_version"], result["final_score"]), ("1.2", 20))
+            self.assertFalse(result["cache_hit"])
+        self.assertEqual(analyzer.call_count, 2)
+        self.assertEqual(self.cached.return_value["ruleset_version"], "1.1")
+
+    def test_ruleset_change_recalculates_local_score_with_historical_vt(self):
+        cached = self.old_wooribank_cache()
+        cached.update(
+            final_score=100, risk_score=100, status="danger", vt_score_delta=70,
+            vt_available=True, vt_source="url_report", vt_malicious=3,
+            vt_checked_at=850,
+        )
+        self.cached.return_value = cached
+        result = url_cache.analyze_url_with_cache("https://wooribank.com", analyzer=analyze_url)
+        self.assertEqual((result["ruleset_version"], result["local_score"]), ("1.2", 20))
+        self.assertEqual((result["vt_score_delta"], result["final_score"]), (70, 90))
+        self.assertFalse(result["analysis_flags"]["suspicious_brand_domain"])
+        self.assertFalse(result["cache_revalidated"])
+        self.assertEqual(self.save.call_args.kwargs["last_checked_at"], 990)
+        self.assertEqual(self.save.call_args.kwargs["vt_checked_at"], 850)
+
+    def test_actual_api_recalculates_old_cache_for_direct_and_body_urls(self):
+        self.cached.return_value = self.old_wooribank_cache()
+        inputs = (
+            ("/scan", {"url": "https://wooribank.com"}, False),
+            ("/analyze-qr", {"content": "https://wooribank.com"}, False),
+            ("/analyze-qr", {"content": "확인: https://wooribank.com"}, True),
+            ("/analyze-qr", {"content": "확인: wooribank.com"}, True),
+            ("/analyze-qr", {"content": "SMS:+12125550101:wooribank.com"}, True),
+            ("/analyze-qr", {"content": "mailto:user@recipient.invalid?body=wooribank.com"}, True),
+        )
+        with TestClient(main.app) as client:
+            for path, payload, embedded in inputs:
+                with self.subTest(path=path, payload=payload):
+                    response = client.post(path, json=payload)
+                    self.assertEqual(response.status_code, 200)
+                    result = response.json()
+                    self.assertEqual(result["ruleset_version"], "1.2")
+                    scored = result["embedded_url_results"][0] if embedded else result
+                    self.assertEqual((scored["ruleset_version"], scored["final_score"]), ("1.2", 20))
+                    self.assertEqual(scored["revalidation_reason"], "ruleset_changed")
+                    if embedded:
+                        self.assertEqual(result["final_score"], max(result["text_score"], 20))
+                        self.assertTrue(result["embedded_url_analysis_complete"])
+
+    def test_current_cache_api_keeps_https_assumption_request_specific(self):
+        current = analyze_url("https://wooribank.com")
+        cached = make_cache_item(
+            "https://wooribank.com", checked_at=990,
+            **{key: current[key] for key in url_cache._CACHE_RESULT_FIELDS},
+        )
+        self.cached.return_value = cached
+        with patch("app.main.analyze_url", side_effect=AssertionError("cache must be reused")):
+            with TestClient(main.app) as client:
+                for candidate in (True, False, True):
+                    content = "확인: " + ("wooribank.com" if candidate else "https://wooribank.com")
+                    response = client.post("/analyze-qr", json={"content": content})
+                    self.assertEqual(response.status_code, 200)
+                    result = response.json()
+                    child = result["embedded_url_results"][0]
+                    self.assertTrue(child["cache_hit"])
+                    self.assertEqual(child["ruleset_version"], "1.2")
+                    self.assertEqual(child["assumed_https"], candidate)
+                    self.assertEqual(child["original_candidates"], ["wooribank.com"] if candidate else [])
+                    self.assertEqual(child["original_url"], "wooribank.com" if candidate else "https://wooribank.com")
+                    self.assertEqual(ASSUMED_HTTPS_REASON in child["reasons"], candidate)
+                direct = client.post("/scan", json={"url": "https://wooribank.com"}).json()
+                self.assertTrue(direct["cache_hit"])
+                self.assertEqual((direct["ruleset_version"], direct["final_score"]), ("1.2", 20))
+                self.assertNotIn(ASSUMED_HTTPS_REASON, direct["reasons"])
+        self.assertNotIn(ASSUMED_HTTPS_REASON, cached["reasons"])
+        self.assertNotIn("assumed_https", cached)
+        self.save.assert_not_called()
+
+    def test_failed_direct_recalculation_api_returns_generic_error(self):
+        self.cached.return_value = self.old_wooribank_cache()
+        with patch("app.main.analyze_url", side_effect=RuntimeError("secret-key internal hostname")):
+            with TestClient(main.app) as client:
+                for path, payload in (
+                    ("/scan", {"url": "https://wooribank.com"}),
+                    ("/analyze-qr", {"content": "https://wooribank.com"}),
+                ):
+                    with self.subTest(path=path):
+                        response = client.post(path, json=payload)
+                        self.assertEqual(response.status_code, 503)
+                        self.assertEqual(set(response.json()), {"detail"})
+                        self.assertNotIn("secret-key", response.text)
+                        self.assertNotIn("ruleset_version", response.json())
+        self.save.assert_not_called()
+        self.assertEqual(self.cached.return_value["ruleset_version"], "1.1")
+
+    def test_partial_body_recalculation_failure_preserves_parent_and_success(self):
+        cached = self.old_wooribank_cache()
+        self.cached.side_effect = lambda url: cached if url == "https://wooribank.com" else None
+        parent = make_structured_parent_result(
+            "sms", ["https://wooribank.com", "https://example.invalid"], 55,
+        )
+        def analyze(url):
+            if url == "https://wooribank.com":
+                raise RuntimeError("secret-key internal hostname")
+            return analyze_url(url)
+        with (
+            patch("app.main.analyze_non_url_qr", return_value=parent),
+            patch("app.main.analyze_url", side_effect=analyze),
+            TestClient(main.app) as client,
+        ):
+            response = client.post("/analyze-qr", json={"content": "SMS:recipient:body"})
+        self.assertEqual(response.status_code, 200)
+        result = response.json()
+        self.assertEqual((result["ruleset_version"], result["final_score"]), ("1.2", 55))
+        self.assertEqual(result["text_score"], 55)
+        self.assertEqual(result["embedded_url_max_score"], 10)
+        self.assertEqual(result["analyzed_embedded_url_count"], 1)
+        self.assertFalse(result["embedded_url_analysis_complete"])
+        self.assertEqual(result["embedded_url_results"][0]["ruleset_version"], "1.2")
+        self.assertEqual(result["embedded_url_failures"][0]["error_code"], "EMBEDDED_URL_ANALYSIS_FAILED")
+        self.assertNotIn("secret-key", response.text)
+        self.assertEqual(cached["ruleset_version"], "1.1")
+        self.save.assert_called_once()
+        self.assertEqual(self.save.call_args.args[0], "https://example.invalid")
 
 
 class UrlCacheTests(unittest.TestCase):

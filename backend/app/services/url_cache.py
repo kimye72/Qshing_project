@@ -75,9 +75,30 @@ _REQUIRED_CACHE_FIELDS = {
     "message",
     "reasons",
     "analysis_flags",
-    "ruleset_version",
     "last_checked_at",
 }
+
+
+class UrlAnalysisUnavailableError(RuntimeError):
+    """A current-ruleset calculation could not be completed."""
+
+
+def _require_current_ruleset(result: dict[str, Any]) -> None:
+    if not isinstance(result, dict) or result.get("ruleset_version") != RULESET_VERSION:
+        raise UrlAnalysisUnavailableError("Current URL ruleset calculation required")
+
+
+def _analyze_current_url(
+    url: str,
+    analyzer: Callable[[str], dict[str, Any]],
+) -> dict[str, Any]:
+    try:
+        result = analyzer(url)
+        _require_current_ruleset(result)
+        return result
+    except Exception as exc:
+        logger.warning("URL calculation failed: %s", type(exc).__name__)
+        raise UrlAnalysisUnavailableError("URL analysis unavailable") from None
 
 
 def _get_cache_table():
@@ -160,6 +181,7 @@ def save_cached_url_analysis(
     increment_scan: bool = False,
     direct_history_initialized: bool | None = None,
 ) -> None:
+    _require_current_ruleset(result)
     now = _utc_epoch_seconds() if now_epoch is None else int(now_epoch)
     checked_at = now if last_checked_at is None else int(last_checked_at)
 
@@ -173,7 +195,7 @@ def save_cached_url_analysis(
         "message": result.get("message", ""),
         "reasons": result.get("reasons", []),
         "analysis_flags": result.get("analysis_flags", {}),
-        "ruleset_version": result.get("ruleset_version", RULESET_VERSION),
+        "ruleset_version": result["ruleset_version"],
         "vt_available": bool(result.get("vt_available", False)),
         "vt_source": result.get("vt_source"),
         "vt_malicious": int(result.get("vt_malicious", 0) or 0),
@@ -329,6 +351,8 @@ def _record_deferred_revalidation(url_hash: str, attempted_at: int) -> None:
 
 
 def _cache_item_is_usable(item: Any) -> bool:
+    # Missing versions remain structurally usable but must take the
+    # ruleset_changed path; they can never qualify for a cache hit.
     if not isinstance(item, dict) or not _REQUIRED_CACHE_FIELDS.issubset(item):
         return False
     if not isinstance(item.get("url_hash"), str):
@@ -350,6 +374,7 @@ def _cache_item_is_usable(item: Any) -> bool:
 
 
 def _restore_cached_result(url: str, item: dict[str, Any]) -> dict[str, Any]:
+    _require_current_ruleset(item)
     decoded_url, _ = _decode_repeatedly(url)
     return {
         "url": url,
@@ -362,7 +387,7 @@ def _restore_cached_result(url: str, item: dict[str, Any]) -> dict[str, Any]:
         "vt_score_delta": int(item.get("vt_score_delta", 0)),
         "final_score": int(item.get("final_score", item.get("risk_score", 0))),
         "risk_score": int(item.get("risk_score", 0)),
-        "ruleset_version": item.get("ruleset_version", RULESET_VERSION),
+        "ruleset_version": item["ruleset_version"],
         "status": item.get("status"),
         "message": item.get("message", ""),
         "reasons": list(item.get("reasons") or []),
@@ -543,7 +568,7 @@ def analyze_url_with_cache(
     if not URL_CACHE_ENABLED:
         return _with_context_history_policy(
             _with_cache_metadata(
-                analyzer(url),
+                _analyze_current_url(url, analyzer),
                 cache_hit=False,
                 cache_age_seconds=None,
                 cache_revalidated=False,
@@ -563,7 +588,7 @@ def analyze_url_with_cache(
         lookup_failed = True
 
     if not _cache_item_is_usable(cached):
-        result = analyzer(url)
+        result = _analyze_current_url(url, analyzer)
         vt_checked_at = now if _has_current_vt_report(result) else None
         if not lookup_failed:
             _try_save_cache(
@@ -641,7 +666,7 @@ def analyze_url_with_cache(
             event_type=event_type,
         )
 
-    result = analyzer(url)
+    result = _analyze_current_url(url, analyzer)
     has_current_vt_report = _has_current_vt_report(result)
 
     if ruleset_matches and not has_current_vt_report:
@@ -664,7 +689,10 @@ def analyze_url_with_cache(
         )
 
     if not ruleset_matches and not has_current_vt_report and _has_historical_vt_result(cached):
-        result = analyze_url_with_vt_result(url, _cached_vt_result(cached))
+        result = _analyze_current_url(
+            url,
+            lambda address: analyze_url_with_vt_result(address, _cached_vt_result(cached)),
+        )
         risk_changed = _risk_changed(cached, result)
         previous_checked_at = _as_epoch_seconds(cached.get("last_checked_at")) or 0
         previous_vt_checked_at = _as_epoch_seconds(cached.get("vt_checked_at"))

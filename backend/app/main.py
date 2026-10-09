@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from mangum import Mangum
 
 from app.constants import (
@@ -30,7 +31,7 @@ from app.services.qr_analyzer import (
     analyze_non_url_qr, decode_repeatedly, normalize_http_url,
 )
 from app.services.scanner import analyze_url
-from app.services.url_cache import analyze_url_with_cache
+from app.services.url_cache import UrlAnalysisUnavailableError, analyze_url_with_cache
 
 
 APP_VERSION = "0.4.0"
@@ -56,6 +57,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(UrlAnalysisUnavailableError)
+async def url_analysis_unavailable_handler(request, exc):
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "URL 분석을 완료하지 못했습니다. 잠시 후 다시 시도해 주세요."},
+    )
 
 
 def attach_db_result(result: dict, db_result: dict) -> dict:

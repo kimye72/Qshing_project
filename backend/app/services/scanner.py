@@ -35,11 +35,15 @@ SUSPICIOUS_KEYWORDS = [
     "bank",
     "password",
     "wallet",
-    "gift",
-    "free",
-    "event",
-    "coupon",
 ]
+# Reward/event words also occur in ordinary page slugs. Treat whole tokens as
+# weak signals; retain the existing stronger credential/payment keyword rules.
+LOW_CONFIDENCE_KEYWORDS = ("gift", "free", "event", "coupon")
+LOW_CONFIDENCE_KEYWORD_SCORE = 5
+LOW_CONFIDENCE_KEYWORD_PATTERNS = {
+    keyword: re.compile(rf"(?<![a-z0-9]){keyword}(?![a-z0-9])", re.IGNORECASE)
+    for keyword in LOW_CONFIDENCE_KEYWORDS
+}
 SQL_XSS_PATTERNS = [
     (r"\bselect\b", "SQL 의심 키워드 포함: select"),
     (r"\bunion\b", "SQL 의심 키워드 포함: union"),
@@ -51,11 +55,12 @@ SQL_XSS_PATTERNS = [
     (r"onerror\s*=", "XSS 의심 패턴 포함: onerror 이벤트"),
     (r"onload\s*=", "XSS 의심 패턴 포함: onload 이벤트"),
 ]
-BRAND_KEYWORDS = ["naver", "kakao", "google", "apple", "paypal", "bank", "pay"]
+# Generic words such as pay/bank are not identifiers of a particular brand.
+BRAND_KEYWORDS = ["naver", "kakao", "google", "apple", "paypal"]
 BRAND_SAFE_DOMAINS = {
     "naver": ["naver.com", "www.naver.com"],
     "kakao": ["kakao.com", "www.kakao.com", "kakaocorp.com"],
-    "google": ["google.com", "www.google.com"],
+    "google": ["google.com", "www.google.com", "google.co.kr"],
     "apple": ["apple.com", "www.apple.com"],
     "paypal": ["paypal.com", "www.paypal.com"],
 }
@@ -111,17 +116,17 @@ def _is_shortener_domain(domain: str) -> bool:
     return domain in SHORTENER_DOMAINS or any(domain.endswith(f".{item}") for item in SHORTENER_DOMAINS)
 
 
-def _has_suspicious_brand_domain(domain: str) -> bool:
+def _has_suspicious_brand_domain(hostname: str) -> bool:
     """
     유명 서비스명이 도메인에 포함되어 있지만 공식 도메인이 아닌 경우를 단순 휴리스틱으로 탐지합니다.
     완벽한 피싱 탐지가 아니라 주의 신호를 추가하기 위한 보조 로직입니다.
     """
-    domain = domain.lower().strip(".")
+    hostname = hostname.lower().rstrip(".")
     for brand in BRAND_KEYWORDS:
-        if brand not in domain:
+        if brand not in hostname:
             continue
         safe_domains = BRAND_SAFE_DOMAINS.get(brand, [])
-        if domain not in safe_domains and not any(domain.endswith(f".{safe}") for safe in safe_domains):
+        if hostname not in safe_domains and not any(hostname.endswith(f".{safe}") for safe in safe_domains):
             return True
     return False
 
@@ -140,6 +145,7 @@ def _get_local_heuristic_score(url: str, domain: str, decoded_url: str) -> tuple
         "shortener": False,
         "userinfo_in_url": False,
         "suspicious_keyword_count": 0,
+        "low_confidence_keyword_count": 0,
         "sql_xss_pattern_count": 0,
         "suspicious_brand_domain": False,
         "punycode_hostname": False,
@@ -221,6 +227,21 @@ def _get_local_heuristic_score(url: str, domain: str, decoded_url: str) -> tuple
             risk_score += 10
             flags["suspicious_keyword_count"] += 1
             reasons.append(f"의심 키워드 포함: {keyword}")
+
+    # Parse first, then decode individual components. Scheme/userinfo are not
+    # page text, and an encoded delimiter must not introduce a different host.
+    keyword_content = " ".join((
+        hostname,
+        _decode_repeatedly(parsed.path)[0],
+        _decode_repeatedly(parsed.query)[0],
+        _decode_repeatedly(parsed.fragment)[0],
+    ))
+    for keyword, pattern in LOW_CONFIDENCE_KEYWORD_PATTERNS.items():
+        if pattern.search(keyword_content):
+            risk_score += LOW_CONFIDENCE_KEYWORD_SCORE
+            flags["suspicious_keyword_count"] += 1
+            flags["low_confidence_keyword_count"] += 1
+            reasons.append(f"약한 보상·행사 키워드 포함: {keyword}")
 
     if _is_shortener_domain(hostname):
         risk_score += 20
