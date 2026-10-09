@@ -7,7 +7,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app import main
-from app.constants import RULESET_VERSION
+from app.constants import ASSUMED_HTTPS_REASON, EMBEDDED_URL_POLICY_VERSION, RULESET_VERSION
 from app.schemas import QRAnalyzeRequest, QRAnalyzeResponse, ScanRequest, ScanResponse
 from app.services import database, qr_analyzer, url_cache
 from app.services.qr_analyzer import analyze_non_url_qr
@@ -185,6 +185,277 @@ def make_cache_item(url: str, *, checked_at: int, **updates) -> dict:
     return item
 
 
+class SchemelessEmbeddedUrlTests(unittest.TestCase):
+    """Exercise the real extraction, routing, scoring and API serialization offline."""
+
+    def setUp(self):
+        self.cache_setting = patch.object(url_cache, "URL_CACHE_ENABLED", False)
+        self.cache_setting.start()
+        self.addCleanup(self.cache_setting.stop)
+        self.vt = patch("app.services.scanner.get_url_report", return_value={
+            "enabled": False, "available": False,
+        })
+        self.vt.start()
+        self.addCleanup(self.vt.stop)
+        self.db = patch("app.main.save_scan_result", return_value=make_db_result())
+        self.db.start()
+        self.addCleanup(self.db.stop)
+
+    def analyze(self, content):
+        return main.analyze_qr(QRAnalyzeRequest(content=content))
+
+    def test_delivery_notice_uses_existing_shortener_score(self):
+        result = self.analyze("택배 안내입니다. 확인: bit.ly/3abcde")
+        self.assertEqual(result["text_score"], 0)
+        self.assertEqual(result["final_score"], 30)
+        self.assertEqual(result["status"], "warning")
+        self.assertEqual(result["extracted_urls"], [])
+        self.assertEqual(result["extracted_url_candidates"], ["bit.ly/3abcde"])
+        child = result["embedded_url_results"][0]
+        self.assertEqual(child["analysis_url"], "https://bit.ly/3abcde")
+        self.assertEqual(child["original_url"], "bit.ly/3abcde")
+        self.assertEqual(child["original_candidates"], ["bit.ly/3abcde"])
+        self.assertTrue(child["assumed_https"])
+        self.assertTrue(child["analysis_flags"]["shortener"])
+        self.assertIn(ASSUMED_HTTPS_REASON, child["reasons"])
+        self.assertIn(ASSUMED_HTTPS_REASON, result["reasons"])
+        self.assertEqual(result["embedded_url_policy_version"], EMBEDDED_URL_POLICY_VERSION)
+
+    def test_domains_paths_and_queries_keep_original_candidate(self):
+        for candidate in ("Example.invalid", "WWW.Example.invalid/Path", "Sub.Example.invalid/A?Token=AbC&Next=Home"):
+            with self.subTest(candidate=candidate):
+                result = self.analyze("확인: " + candidate)
+                child = result["embedded_url_results"][0]
+                self.assertEqual(child["original_url"], candidate)
+                self.assertEqual(child["analysis_url"], qr_analyzer.normalize_http_url("https://" + candidate))
+                self.assertEqual(child["local_score"], 10)
+
+    def test_structured_body_candidates_preserve_encoded_query_boundaries(self):
+        candidate = "Body.Example.invalid/Path?Token=AbC&Next=Home?x=Y"
+        encoded = "Body.Example.invalid%2FPath%3FToken%3DAbC%26Next%3DHome%3Fx%3DY"
+        cases = (
+            (f"SMS:+12125550101:{encoded}", "sms"),
+            (f"SMSTO:+12125550101:{encoded}", "sms"),
+            (f"sms:+12125550101?body={encoded}&subject=ignored.invalid", "sms"),
+            (f"mailto:user@recipient.invalid?subject=subject.invalid&body={encoded}", "email"),
+        )
+        for content, qr_type in cases:
+            with self.subTest(content=content):
+                result = self.analyze(content)
+                self.assertEqual(result["qr_type"], qr_type)
+                self.assertEqual(result["embedded_url_count"], 1)
+                child = result["embedded_url_results"][0]
+                self.assertEqual(child["original_candidates"], [candidate])
+                self.assertEqual(child["analysis_url"], "https://body.example.invalid/Path?Token=AbC&Next=Home?x=Y")
+                self.assertEqual(result["structured_content"][f'{"sms" if qr_type == "sms" else "email"}_body_preview'], candidate)
+
+    def test_recipient_decoding_cannot_create_a_body_field(self):
+        for content in (
+            "sms:recipient.invalid%3Fbody%3Dfake.invalid?body=body.invalid/Path",
+            "sms:recipient.invalid%3Ahidden.invalid?body=body.invalid/Path",
+            "SMSTO:recipient.invalid%3Ahidden.invalid:body.invalid/Path",
+            "mailto:user%3Fbody%3Dfake.invalid@recipient.invalid?body=body.invalid/Path",
+            "mailto:user@recipient.invalid?subject=subject.invalid%26body%3Dfake.invalid&body=body.invalid/Path",
+        ):
+            with self.subTest(content=content):
+                result = self.analyze(content)
+                self.assertEqual(result["embedded_url_count"], 1)
+                self.assertEqual(result["embedded_url_results"][0]["analysis_url"], "https://body.invalid/Path")
+
+    def test_non_body_domains_never_invoke_url_analysis(self):
+        for content in (
+            "mailto:user@recipient.invalid?subject=subject.invalid",
+            "mailto:user@recipient.invalid?subject=https%3A%2F%2Fsubject.invalid&body=hello",
+            "sms:recipient.invalid?subject=subject.invalid&body=hello",
+            "sms:+12125550101?subject=https://subject.invalid/Path",
+            "sms:+12125550101?subject=prefix:subject.invalid/Path",
+            "sms:+12125550101?other=prefix:ignored.invalid/Path",
+            "SMSTO:recipient.invalid:hello",
+            "sms:recipient.invalid%3Fbody%3Dfake.invalid",
+            "WIFI:T:WPA;S:ssid.invalid;P:testpassword;;",
+            "WIFI:T:WPA;S:https://ssid.invalid;P:testpassword;;",
+        ):
+            with self.subTest(content=content), patch("app.main.analyze_url_with_cache") as cache:
+                result = self.analyze(content)
+                cache.assert_not_called()
+                self.assertEqual(result["embedded_url_count"], 0)
+
+    def test_email_files_invalid_domains_and_other_schemes_are_excluded(self):
+        for text in (
+            "user@sub.example.invalid", "report.pdf photo.png archive.zip",
+            "192.168.0.1", "-invalid.example", "example..invalid",
+            "ftp://files.example.invalid/Path", "custom:example.invalid/Path",
+            "file://files.example.invalid/Path", "javascript:example.invalid/Path",
+        ):
+            for content in (text, "SMSTO:+12125550101:" + text):
+                with self.subTest(content=content), patch("app.main.analyze_url_with_cache") as cache:
+                    result = self.analyze(content)
+                    cache.assert_not_called()
+                    self.assertEqual(result["embedded_url_count"], 0)
+
+    def test_explicit_link_and_candidate_share_one_call_with_provenance(self):
+        with patch("app.main.analyze_url_with_cache", side_effect=lambda url, **_: make_url_result(url)) as cache:
+            result = self.analyze("안내: https://EXAMPLE.invalid/Path?Key=AbC Example.invalid/Path?Key=AbC")
+        cache.assert_called_once_with("https://example.invalid/Path?Key=AbC", analyzer=main.analyze_url, analysis_context="embedded")
+        self.assertEqual(result["embedded_url_count"], 1)
+        child = result["embedded_url_results"][0]
+        self.assertEqual(child["original_candidates"], ["Example.invalid/Path?Key=AbC"])
+        self.assertTrue(child["assumed_https"])
+        self.assertEqual(result["extracted_urls"], ["https://EXAMPLE.invalid/Path?Key=AbC"])
+
+    def test_path_and_query_case_create_distinct_analysis_addresses(self):
+        text = "안내: Example.invalid/Path?Q=A EXAMPLE.invalid/Path?Q=A example.invalid/path?Q=A https://EXAMPLE.invalid/Path?Q=a"
+        with patch("app.main.analyze_url_with_cache", side_effect=lambda url, **_: make_url_result(url)) as cache:
+            result = self.analyze(text)
+        self.assertEqual(result["candidate_url_count"], 2)
+        self.assertEqual(result["embedded_url_count"], 3)
+        self.assertEqual({call.args[0] for call in cache.call_args_list}, {
+            "https://example.invalid/Path?Q=A", "https://example.invalid/path?Q=A",
+            "https://example.invalid/Path?Q=a",
+        })
+
+    def test_http_and_https_remain_distinct_and_explicit_only_has_no_assumption(self):
+        result = self.analyze("안내: http://example.invalid/Path example.invalid/Path")
+        self.assertEqual(result["embedded_url_count"], 2)
+        self.assertFalse(result["embedded_url_results"][0]["assumed_https"])
+        self.assertTrue(result["embedded_url_results"][1]["assumed_https"])
+        self.assertEqual(result["final_score"], 30)
+
+    def test_combined_limit_counts_all_targets_and_prioritizes_explicit_urls(self):
+        body = "a.invalid https://b.invalid https://c.invalid d.invalid e.invalid"
+        for content in ("안내: " + body, "SMSTO:+12125550101:" + body, "mailto:user@recipient.invalid?body=" + body):
+            with self.subTest(content=content), patch("app.main.analyze_url_with_cache", side_effect=lambda url, **_: make_url_result(url)) as cache:
+                result = self.analyze(content)
+                self.assertEqual(cache.call_count, 3)
+                self.assertEqual([call.args[0] for call in cache.call_args_list], ["https://b.invalid", "https://c.invalid", "https://a.invalid"])
+                self.assertEqual(result["embedded_url_count"], 5)
+                self.assertFalse(result["embedded_url_analysis_complete"])
+                self.assertEqual(result["analysis_flags"]["embedded_url_skipped_count"], 2)
+
+    def test_failure_preserves_parent_and_api_exposes_only_public_error(self):
+        content = "SMSTO:+12125550101:긴급 로그인 확인 bit.ly/3abcde"
+        parent = analyze_non_url_qr(content)
+        with patch("app.main.analyze_url_with_cache", side_effect=RuntimeError("secret-key internal host")):
+            response = TestClient(main.app).post("/analyze-qr", json={"content": content})
+        self.assertEqual(response.status_code, 200)
+        result = response.json()
+        self.assertEqual(result["risk_score"], parent["risk_score"])
+        self.assertEqual(result["message"], parent["message"])
+        self.assertEqual(result["status"], parent["status"])
+        self.assertFalse(result["embedded_url_analysis_complete"])
+        self.assertEqual(result["analyzed_embedded_url_count"], 0)
+        failure = result["embedded_url_failures"][0]
+        self.assertEqual(failure["original_url"], "bit.ly/3abcde")
+        self.assertEqual(failure["analysis_url"], "https://bit.ly/3abcde")
+        self.assertTrue(failure["assumed_https"])
+        self.assertEqual(failure["error_code"], "EMBEDDED_URL_ANALYSIS_FAILED")
+        self.assertNotIn("secret-key", response.text)
+        self.assertTrue(any("완료되지" in reason for reason in result["reasons"]))
+
+    def test_partial_failure_preserves_successful_url_evidence(self):
+        for prefix, url_score in (("긴급 로그인 확인", 80), ("긴급 지금 송금하세요", 10)):
+            with self.subTest(prefix=prefix):
+                content = f"{prefix}: failed.invalid good.invalid"
+                parent = analyze_non_url_qr(content)
+
+                def analyze(url, **_):
+                    if "failed.invalid" in url:
+                        raise RuntimeError("private failure")
+                    return make_scored_url_result(url, url_score)
+
+                with patch("app.main.analyze_url_with_cache", side_effect=analyze):
+                    response = TestClient(main.app).post("/analyze-qr", json={"content": content})
+                self.assertEqual(response.status_code, 200)
+                result = response.json()
+                self.assertEqual(result["text_score"], parent["risk_score"])
+                self.assertEqual(result["final_score"], max(parent["risk_score"], url_score))
+                self.assertEqual(result["embedded_url_results"][0]["analysis_url"], "https://good.invalid")
+                self.assertEqual(result["embedded_url_results"][0]["final_score"], url_score)
+                self.assertEqual(result["analyzed_embedded_url_count"], 1)
+                self.assertEqual(result["analysis_flags"]["embedded_url_failed_count"], 1)
+                self.assertFalse(result["embedded_url_analysis_complete"])
+                self.assertEqual(result["embedded_url_failures"][0]["error_code"], "EMBEDDED_URL_ANALYSIS_FAILED")
+                self.assertNotIn("private failure", response.text)
+
+    def test_real_api_response_keeps_candidate_analysis_and_assumption(self):
+        response = TestClient(main.app).post("/analyze-qr", json={"content": "확인: bit.ly/3abcde"})
+        self.assertEqual(response.status_code, 200)
+        result = response.json()
+        QRAnalyzeResponse.model_validate(result)
+        self.assertEqual(result["extracted_urls"], [])
+        self.assertFalse(result["contains_url"])
+        self.assertEqual(result["extracted_url_candidates"], ["bit.ly/3abcde"])
+        self.assertEqual(result["embedded_url_policy_version"], EMBEDDED_URL_POLICY_VERSION)
+        self.assertEqual(result["embedded_url_results"][0]["analysis_url"], "https://bit.ly/3abcde")
+        self.assertEqual(result["embedded_url_results"][0]["original_candidates"], ["bit.ly/3abcde"])
+        self.assertTrue(result["embedded_url_results"][0]["assumed_https"])
+        self.assertTrue(result["embedded_url_analysis_complete"])
+
+    def test_assumed_https_uses_existing_cache_without_mutating_cached_reasons(self):
+        url = "https://example.invalid/Path?Key=AbC"
+        cached = make_cache_item(url, checked_at=950)
+        with (
+            patch.object(url_cache, "URL_CACHE_ENABLED", True),
+            patch.object(url_cache, "_utc_epoch_seconds", return_value=1000),
+            patch.object(url_cache, "get_cached_url_analysis", return_value=cached) as lookup,
+            patch.object(url_cache, "record_cached_url_scan") as counter,
+            patch("app.main.analyze_url") as analyzer,
+        ):
+            result = self.analyze("확인: EXAMPLE.invalid/Path?Key=AbC")
+        lookup.assert_called_once_with(url)
+        counter.assert_not_called()
+        analyzer.assert_not_called()
+        child = result["embedded_url_results"][0]
+        self.assertTrue(child["cache_hit"])
+        self.assertTrue(child["assumed_https"])
+        self.assertIn(ASSUMED_HTTPS_REASON, child["reasons"])
+        self.assertNotIn(ASSUMED_HTTPS_REASON, cached["reasons"])
+
+    def test_cached_explicit_and_assumed_requests_keep_separate_metadata(self):
+        url = "https://example.invalid/Path?Key=AbC"
+        candidate = "EXAMPLE.invalid/Path?Key=AbC"
+        cached = make_cache_item(url, checked_at=950)
+        original_reasons = list(cached["reasons"])
+        original_flags = dict(cached["analysis_flags"])
+        for assumed_first in (False, True):
+            with (
+                self.subTest(assumed_first=assumed_first),
+                patch.object(url_cache, "URL_CACHE_ENABLED", True),
+                patch.object(url_cache, "_utc_epoch_seconds", return_value=1000),
+                patch.object(url_cache, "get_cached_url_analysis", return_value=cached) as lookup,
+                patch.object(url_cache, "record_cached_url_scan") as counter,
+                patch("app.main.analyze_url") as analyzer,
+                patch.object(url_cache, "save_cached_url_analysis") as write,
+            ):
+                client = TestClient(main.app)
+                for assumed in (assumed_first, not assumed_first, assumed_first):
+                    original = candidate if assumed else url
+                    response = client.post("/analyze-qr", json={"content": "확인: " + original})
+                    self.assertEqual(response.status_code, 200)
+                    child = response.json()["embedded_url_results"][0]
+                    self.assertTrue(child["cache_hit"])
+                    self.assertEqual(child["original_url"], original)
+                    self.assertEqual(child["analysis_url"], url)
+                    self.assertEqual(child["assumed_https"], assumed)
+                    self.assertEqual(child["original_candidates"], [candidate] if assumed else [])
+                    self.assertEqual(ASSUMED_HTTPS_REASON in child["reasons"], assumed)
+                    self.assertEqual(ASSUMED_HTTPS_REASON in response.json()["reasons"], assumed)
+                direct = client.post("/analyze-qr", json={"content": url}).json()
+                self.assertEqual(direct["qr_type"], "url")
+                self.assertTrue(direct["cache_hit"])
+                self.assertEqual(direct["extracted_url_candidates"], [])
+                self.assertEqual(direct["embedded_url_results"], [])
+                self.assertNotIn(ASSUMED_HTTPS_REASON, direct["reasons"])
+                self.assertEqual([call.args[0] for call in lookup.call_args_list], [url] * 4)
+                counter.assert_called_once()
+                analyzer.assert_not_called()
+                write.assert_not_called()
+                self.assertEqual(cached["reasons"], original_reasons)
+                self.assertEqual(cached["analysis_flags"], original_flags)
+                self.assertNotIn("assumed_https", cached)
+                self.assertNotIn("original_candidates", cached)
+
+
 class SmsPayloadParsingTests(unittest.TestCase):
     """Synthetic fixtures using reserved 555-01xx numbers and .invalid URLs."""
 
@@ -265,6 +536,18 @@ class SmsPayloadParsingTests(unittest.TestCase):
 
     def test_recipient_only_regression(self):
         self.assert_sms_payload("sms:+12125550107", "+12125550107", None)
+
+    def test_query_fields_with_colons_do_not_start_a_body(self):
+        for query in (
+            "subject=https://subject.invalid/Path",
+            "subject=prefix:subject.invalid/Path",
+            "other=prefix:ignored.invalid/Path",
+            "subject=https%3A%2F%2Fsubject.invalid%2FPath",
+        ):
+            with self.subTest(query=query):
+                self.assert_sms_payload(
+                    f"sms:+12125550107?{query}", "+12125550107", None,
+                )
 
     def test_colon_message_preserves_unencoded_url_query(self):
         url = "https://notice.example.invalid/guide?a=1&b=2"
@@ -856,9 +1139,9 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
         )
         QRAnalyzeResponse.model_validate(parent)
 
-    def test_scheme_less_candidate_is_reported_without_url_analysis(self):
+    def test_scheme_less_candidate_uses_assumed_https_analysis(self):
         with (
-            patch("app.main.analyze_url_with_cache") as cache_mock,
+            patch("app.main.analyze_url_with_cache", side_effect=lambda url, **_: make_url_result(url)) as cache_mock,
             patch("app.main.save_scan_result", return_value=make_db_result()),
             patch.object(
                 qr_analyzer,
@@ -868,7 +1151,8 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
         ):
             result = main.analyze_qr(QRAnalyzeRequest(content="example.com"))
 
-        cache_mock.assert_not_called()
+        cache_mock.assert_called_once()
+        self.assertEqual(cache_mock.call_args.args[0], "https://example.com")
         candidate_extractor.assert_called_once()
         self.assertEqual(result["qr_type"], "text_with_url")
         self.assertFalse(result["contains_url"])
@@ -876,7 +1160,8 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
         self.assertEqual(result["extracted_url_candidates"], ["example.com"])
         self.assertEqual(result["candidate_url_count"], 1)
         self.assertEqual(result["text_score"], 0)
-        self.assertEqual(result["embedded_url_results"], [])
+        self.assertEqual(result["embedded_url_results"][0]["original_url"], "example.com")
+        self.assertTrue(result["embedded_url_results"][0]["assumed_https"])
         QRAnalyzeResponse.model_validate(result)
 
     def test_scheme_less_candidate_preserves_path_and_original_case(self):
@@ -928,8 +1213,8 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
         ):
             result = main.analyze_qr(QRAnalyzeRequest(content=content))
 
-        cache_mock.assert_called_once()
-        self.assertEqual(cache_mock.call_args.args[0], "https://example.com")
+        self.assertEqual(cache_mock.call_count, 2)
+        self.assertEqual([call.args[0] for call in cache_mock.call_args_list], ["https://example.com", "https://example.org"])
         self.assertEqual(result["extracted_urls"], ["https://example.com"])
         self.assertEqual(result["extracted_url_candidates"], ["example.org"])
         self.assertEqual(result["text_score"], 0)
@@ -958,30 +1243,34 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
     def test_candidate_response_list_is_limited_to_ten(self):
         content = " ".join(f"site{index}.example" for index in range(11))
         with (
-            patch("app.main.analyze_url_with_cache") as cache_mock,
+            patch("app.main.analyze_url_with_cache", side_effect=lambda url, **_: make_url_result(url)) as cache_mock,
             patch("app.main.save_scan_result", return_value=make_db_result()),
         ):
             result = main.analyze_qr(QRAnalyzeRequest(content=content))
 
-        cache_mock.assert_not_called()
+        self.assertEqual(cache_mock.call_count, 3)
+        self.assertEqual(result["embedded_url_count"], 11)
         self.assertEqual(result["candidate_url_count"], 11)
         self.assertEqual(len(result["extracted_url_candidates"]), 10)
 
-    def test_punycode_candidate_does_not_add_a_new_risk_rule(self):
+    def test_punycode_candidate_uses_existing_url_risk_rule(self):
         with (
-            patch("app.main.analyze_url_with_cache") as cache_mock,
+            patch("app.services.scanner.get_url_report", return_value={"enabled": False, "available": False}),
+            patch.object(url_cache, "URL_CACHE_ENABLED", False),
+            patch("app.main.analyze_url", wraps=analyze_url) as analyzer_mock,
             patch("app.main.save_scan_result", return_value=make_db_result()),
         ):
             result = main.analyze_qr(
                 QRAnalyzeRequest(content="xn--example-xxxx.com")
             )
 
-        cache_mock.assert_not_called()
+        analyzer_mock.assert_called_once_with("https://xn--example-xxxx.com")
         self.assertEqual(
             result["extracted_url_candidates"],
             ["xn--example-xxxx.com"],
         )
-        self.assertEqual(result["risk_score"], 0)
+        self.assertEqual(result["risk_score"], 25)
+        self.assertEqual(result["text_score"], 0)
         self.assertNotIn("punycode_hostname", result["analysis_flags"])
 
     def test_embedded_punycode_url_uses_same_url_analyzer_rules(self):
@@ -1717,9 +2006,9 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
         log_mock.assert_called_once()
         db_mock.assert_called_once()
 
-    def test_sms_schemeless_body_does_not_call_url_analyzer(self):
+    def test_sms_schemeless_body_calls_url_analyzer(self):
         with (
-            patch("app.main.analyze_url_with_cache") as cache_mock,
+            patch("app.main.analyze_url_with_cache", side_effect=lambda url, **_: make_url_result(url)) as cache_mock,
             patch("app.main.save_scan_result", return_value=make_db_result()),
         ):
             result = main.analyze_qr(
@@ -1730,8 +2019,9 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
 
         self.assertEqual(result["qr_type"], "sms")
         self.assertTrue(result["contains_url_candidate"])
-        self.assertEqual(result["embedded_url_count"], 0)
-        cache_mock.assert_not_called()
+        self.assertEqual(result["embedded_url_count"], 1)
+        cache_mock.assert_called_once()
+        self.assertEqual(cache_mock.call_args.args[0], "https://example.com/login")
 
     def test_sms_fresh_embedded_cache_hit_skips_url_analyzer_and_scan_counter(self):
         url = "https://example.com"

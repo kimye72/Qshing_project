@@ -6,7 +6,18 @@ from pydantic import BaseModel, Field, HttpUrl, TypeAdapter, field_validator
 _HTTP_URL_ADAPTER = TypeAdapter(HttpUrl)
 
 
-class EmbeddedUrlResult(BaseModel):
+class EmbeddedUrlTarget(BaseModel):
+    original_url: str = Field(..., description="분석 대상 원본 링크 또는 후보")
+    original_candidates: List[str] = Field(default_factory=list, description="동일 분석 주소로 합쳐진 원본 스킴 없는 후보")
+    analysis_url: str = Field(..., description="URL 분석·캐시에 전달한 주소")
+    assumed_https: bool = Field(default=False, description="스킴 없는 후보에 HTTPS를 가정했는지 여부. HTTPS 지원·안전성 확인을 의미하지 않음")
+
+
+class EmbeddedUrlFailure(EmbeddedUrlTarget):
+    error_code: Literal["EMBEDDED_URL_ANALYSIS_FAILED"]
+
+
+class EmbeddedUrlResult(EmbeddedUrlTarget):
     url: str = Field(..., description="분석한 포함 URL")
     domain: Optional[str] = Field(default=None, description="포함 URL 도메인")
     local_score: int = Field(..., description="포함 URL의 로컬 규칙 점수")
@@ -151,6 +162,13 @@ class QRAnalyzeResponse(BaseModel):
         default_factory=list,
         description="분석된 포함 URL별 결과",
     )
+    embedded_url_failures: List[EmbeddedUrlFailure] = Field(
+        default_factory=list, description="분석 실패한 포함 URL과 공개 오류 코드",
+    )
+    embedded_url_analysis_complete: bool = Field(
+        default=True, description="분석 대상 전체의 분석 완료 여부. 실패·3개 제한 제외 시 false",
+    )
+    embedded_url_policy_version: str = Field(..., description="포함 URL 분석 연결 정책 버전 (점수 규칙 버전과 별도)")
 
     url: Optional[str] = Field(default=None, description="분석 대상 URL")
     domain: Optional[str] = Field(default=None, description="도메인")

@@ -8,7 +8,12 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from mangum import Mangum
 
-from app.constants import MAX_EMBEDDED_URLS_ANALYZED, RULESET_VERSION
+from app.constants import (
+    ASSUMED_HTTPS_REASON,
+    EMBEDDED_URL_POLICY_VERSION,
+    MAX_EMBEDDED_URLS_ANALYZED,
+    RULESET_VERSION,
+)
 from app.schemas import (
     QRAnalyzeRequest,
     QRAnalyzeResponse,
@@ -21,7 +26,9 @@ from app.services.database import (
     list_scan_results,
     save_scan_result,
 )
-from app.services.qr_analyzer import analyze_non_url_qr, decode_repeatedly
+from app.services.qr_analyzer import (
+    analyze_non_url_qr, decode_repeatedly, normalize_http_url,
+)
 from app.services.scanner import analyze_url
 from app.services.url_cache import analyze_url_with_cache
 
@@ -116,6 +123,9 @@ def ensure_analysis_contract(result: dict) -> dict:
     result.setdefault("analyzed_embedded_url_count", 0)
     result.setdefault("embedded_url_max_score", None)
     result.setdefault("embedded_url_results", [])
+    result.setdefault("embedded_url_failures", [])
+    result.setdefault("embedded_url_analysis_complete", True)
+    result.setdefault("embedded_url_policy_version", EMBEDDED_URL_POLICY_VERSION)
     result.setdefault("local_score", risk_score)
     result.setdefault("vt_score_delta", 0)
     result["final_score"] = risk_score
@@ -232,16 +242,20 @@ def _status_and_message_for_qr(risk_score: int) -> tuple[str, str]:
     )
 
 
-def _embedded_url_response(result: dict, analysis_url: str) -> dict:
+def _embedded_url_response(result: dict, target: dict) -> dict:
+    reasons = list(result.get("reasons") or [])
+    if target["assumed_https"]:
+        reasons.append(ASSUMED_HTTPS_REASON)
     return {
-        "url": result.get("url", analysis_url),
+        **target,
+        "url": result.get("url", target["analysis_url"]),
         "domain": result.get("domain"),
         "local_score": int(result.get("local_score", result.get("risk_score", 0))),
         "vt_score_delta": int(result.get("vt_score_delta", 0)),
         "final_score": int(result.get("final_score", result.get("risk_score", 0))),
         "risk_score": int(result.get("risk_score", result.get("final_score", 0))),
         "status": result.get("status", "safe"),
-        "reasons": list(result.get("reasons") or []),
+        "reasons": reasons,
         "analysis_flags": dict(result.get("analysis_flags") or {}),
         "ruleset_version": result.get("ruleset_version", RULESET_VERSION),
         "vt_available": bool(result.get("vt_available", False)),
@@ -261,18 +275,45 @@ def analyze_text_with_embedded_urls(
     result: dict,
     *,
     extracted_urls: list[str] | None = None,
+    extracted_url_candidates: list[str] | None = None,
 ) -> dict:
     """Combine a non-URL parent's risk with distinct embedded URL results."""
     if extracted_urls is None:
         extracted_urls = list(result.get("extracted_urls") or [])
-    unique_urls = list(dict.fromkeys(extracted_urls))
-    embedded_results: list[dict] = []
-
-    for extracted_url in unique_urls[:MAX_EMBEDDED_URLS_ANALYZED]:
+    if extracted_url_candidates is None:
+        extracted_url_candidates = list(result.get("extracted_url_candidates") or [])
+    # Explicit links take precedence; retain every candidate provenance even
+    # when it aliases an explicit link. Normalize the cache address's host only.
+    targets: dict[str, dict] = {}
+    for original_url, assumed_https in (
+        [(url, False) for url in extracted_urls]
+        + [(candidate, True) for candidate in extracted_url_candidates]
+    ):
+        analysis_url = "https://" + original_url if assumed_https else original_url
         try:
-            analysis_url = resolve_direct_http_url(extracted_url)
+            analysis_url = normalize_http_url(analysis_url)
+        except (ValueError, UnicodeError):
+            # Keep malformed explicit links in the attempted set so that the
+            # per-link failure path can preserve the parent's analysis.
+            pass
+        target = targets.setdefault(analysis_url, {
+            "original_url": original_url,
+            "original_candidates": [],
+            "analysis_url": analysis_url,
+            "assumed_https": False,
+        })
+        if assumed_https:
+            target["assumed_https"] = True
+            if original_url not in target["original_candidates"]:
+                target["original_candidates"].append(original_url)
+    embedded_results: list[dict] = []
+    failures: list[dict] = []
+
+    for target in list(targets.values())[:MAX_EMBEDDED_URLS_ANALYZED]:
+        try:
+            analysis_url = resolve_direct_http_url(target["analysis_url"])
             if analysis_url is None:
-                continue
+                raise ValueError("Invalid embedded HTTP(S) URL")
             url_result = analyze_url_with_cache(
                 analysis_url,
                 analyzer=analyze_url,
@@ -280,9 +321,10 @@ def analyze_text_with_embedded_urls(
             )
             url_result = ensure_analysis_contract(url_result)
             embedded_results.append(
-                _embedded_url_response(url_result, analysis_url)
+                _embedded_url_response(url_result, target)
             )
         except Exception as exc:
+            failures.append({**target, "error_code": "EMBEDDED_URL_ANALYSIS_FAILED"})
             logger.warning(
                 "Embedded URL analysis failed: %s",
                 type(exc).__name__,
@@ -292,10 +334,18 @@ def analyze_text_with_embedded_urls(
     embedded_scores = [item["final_score"] for item in embedded_results]
     embedded_url_max_score = max(embedded_scores) if embedded_scores else None
     final_score = max(text_score, embedded_url_max_score or 0)
-    status, message = _status_and_message_for_qr(final_score)
+    status, message = (
+        _status_and_message_for_qr(final_score) if embedded_results
+        else (result["status"], result["message"])
+    )
 
     qr_type = result.get("qr_type")
     reasons = list(result.get("reasons") or [])
+    if any(target["assumed_https"] for target in list(targets.values())[:MAX_EMBEDDED_URLS_ANALYZED]):
+        reasons.append(ASSUMED_HTTPS_REASON)
+    analysis_complete = len(embedded_results) == len(targets)
+    if not analysis_complete:
+        reasons.append("일부 포함 URL 분석이 완료되지 않았습니다. 분석 실패 또는 최대 3개 제한으로 제외된 URL이 있습니다.")
     if embedded_results:
         pending_reason = "일반 텍스트 안에 URL이 포함되어 있습니다. 포함된 URL 분석이 필요합니다."
         completed_reason = {
@@ -325,19 +375,26 @@ def analyze_text_with_embedded_urls(
     analysis_flags.update(
         {
             "embedded_url_analyzed": bool(embedded_results),
-            "embedded_url_count": len(unique_urls),
+            "embedded_url_count": len(targets),
             "analyzed_embedded_url_count": len(embedded_results),
             "embedded_url_high_risk_count": high_risk_count,
+            "embedded_url_analysis_complete": analysis_complete,
+            "embedded_url_failed_count": len(failures),
+            "embedded_url_skipped_count": max(0, len(targets) - MAX_EMBEDDED_URLS_ANALYZED),
+            "embedded_url_policy_version": EMBEDDED_URL_POLICY_VERSION,
         }
     )
 
     result.update(
         {
             "text_score": text_score,
-            "embedded_url_count": len(unique_urls),
+            "embedded_url_count": len(targets),
             "analyzed_embedded_url_count": len(embedded_results),
             "embedded_url_max_score": embedded_url_max_score,
             "embedded_url_results": embedded_results,
+            "embedded_url_failures": failures,
+            "embedded_url_analysis_complete": analysis_complete,
+            "embedded_url_policy_version": EMBEDDED_URL_POLICY_VERSION,
             "local_score": text_score,
             "vt_score_delta": 0,
             "final_score": final_score,
@@ -420,12 +477,16 @@ def analyze_qr(data: QRAnalyzeRequest):
     else:
         result = analyze_non_url_qr(content)
         embedded_body_urls = result.pop("_embedded_body_urls", [])
+        embedded_candidates = result.pop("_embedded_url_candidates", None)
         if result.get("qr_type") == "text_with_url":
-            result = analyze_text_with_embedded_urls(result)
-        elif result.get("qr_type") in {"sms", "email"} and embedded_body_urls:
+            result = analyze_text_with_embedded_urls(
+                result, extracted_url_candidates=embedded_candidates,
+            )
+        elif result.get("qr_type") in {"sms", "email"} and (embedded_body_urls or embedded_candidates):
             result = analyze_text_with_embedded_urls(
                 result,
                 extracted_urls=embedded_body_urls,
+                extracted_url_candidates=embedded_candidates or [],
             )
 
     result = ensure_analysis_contract(result)

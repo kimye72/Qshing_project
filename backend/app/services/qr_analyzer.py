@@ -21,6 +21,10 @@ URL_PATTERN = re.compile(
     r"https?://[^\s<>'\"]+",
     re.IGNORECASE
 )
+URI_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9._~/?#@!$&()*+,;=%-])"
+    r"[A-Za-z][A-Za-z0-9+.-]*:[^\s<>'\"]+"
+)
 
 DOMAIN_LABEL_PATTERN = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
 URL_CANDIDATE_PATTERN = re.compile(
@@ -361,7 +365,10 @@ def _parse_sms_payload(content: str) -> tuple[str, str | None] | None:
         body = _first_query_value(query, "body") if separator else None
         # An explicit empty query body still takes precedence. For the
         # colon-message compatibility form, split before decoding values.
-        if body is None and ":" in payload:
+        # A colon inside a query value is not the colon-message delimiter.
+        # Limit fallback detection to the raw recipient segment; an actual
+        # colon-message body may still contain its own unencoded URL query.
+        if body is None and ":" in recipient:
             recipient, _, body_value = payload.partition(":")
             body = decode_repeatedly(body_value)
     else:
@@ -545,8 +552,8 @@ def extract_urls(content: str) -> list[str]:
     return URL_PATTERN.findall(content)
 
 
-def _extract_structured_body_urls(content: str, qr_type: str) -> list[str]:
-    """Extract explicit HTTP(S) URLs only from an SMS or mail body."""
+def _extract_structured_body(content: str, qr_type: str) -> str:
+    """Establish field boundaries before decoding an SMS or mail body."""
     try:
         if qr_type == "sms":
             parsed_sms = _parse_sms_payload(content)
@@ -555,10 +562,26 @@ def _extract_structured_body_urls(content: str, qr_type: str) -> list[str]:
             parsed_email = _parse_email_payload(content)
             body = parsed_email[2] if parsed_email is not None else None
         else:
-            return []
-        return extract_urls(body) if body else []
+            return ""
+        return body or ""
     except Exception:
-        return []
+        return ""
+
+
+def _extract_structured_body_urls(content: str, qr_type: str) -> list[str]:
+    return extract_urls(_extract_structured_body(content, qr_type))
+
+
+def normalize_http_url(url: str) -> str:
+    """Normalize scheme/host only, preserving path, query and delimiters."""
+    parsed = urlparse(url)
+    userinfo, separator, host_port = parsed.netloc.rpartition("@")
+    authority = (userinfo + separator if separator else "") + host_port.lower()
+    authority_start = url.index("://") + 3
+    return (
+        parsed.scheme.lower() + "://" + authority
+        + url[authority_start + len(parsed.netloc):]
+    )
 
 
 def _spans_overlap(first: tuple[int, int], second: tuple[int, int]) -> bool:
@@ -585,10 +608,21 @@ def _is_valid_domain_candidate(domain: str, *, has_suffix: bool) -> bool:
     return True
 
 
-def extract_url_candidates(content: str) -> list[str]:
+def extract_url_candidates(
+    content: str, *, preserve_structured_fields: bool = False,
+) -> list[str]:
     """Extract validated schemeless domain candidates without inferring a scheme."""
     excluded_spans = [match.span() for match in URL_PATTERN.finditer(content)]
     excluded_spans.extend(match.span() for match in EMAIL_PATTERN.finditer(content))
+    for match in URI_PATTERN.finditer(content):
+        # Public extraction still describes all structured fields. Analysis
+        # separately extracts the decoded body without this exception.
+        if (
+            preserve_structured_fields and match.start() == 0
+            and match.group(0).lower().startswith(tuple(ACTION_SCHEMES))
+        ):
+            continue
+        excluded_spans.append(match.span())
 
     candidates: list[str] = []
     seen: set[str] = set()
@@ -606,7 +640,7 @@ def extract_url_candidates(content: str) -> list[str]:
         if not _is_valid_domain_candidate(domain, has_suffix=has_suffix):
             continue
 
-        dedupe_key = candidate.casefold()
+        dedupe_key = domain.lower() + candidate[len(domain):]
         if dedupe_key in seen:
             continue
 
@@ -683,7 +717,9 @@ def analyze_non_url_qr(content: str) -> dict:
     )
 
     extracted_urls = extract_urls(public_analysis_content)
-    all_url_candidates = extract_url_candidates(public_analysis_content)
+    all_url_candidates = extract_url_candidates(
+        public_analysis_content, preserve_structured_fields=True,
+    )
     extracted_url_candidates = all_url_candidates[:MAX_URL_CANDIDATES]
     qr_type = detect_qr_type(
         decoded_content,
@@ -694,6 +730,11 @@ def analyze_non_url_qr(content: str) -> dict:
     embedded_body_urls = _extract_structured_body_urls(
         structured_parse_content,
         qr_type,
+    )
+    embedded_url_candidates = (
+        extract_url_candidates(_extract_structured_body(structured_parse_content, qr_type))
+        if qr_type in {"sms", "email"}
+        else all_url_candidates if qr_type == "text_with_url" else []
     )
     social_engineering_categories = _detect_social_engineering_categories(
         public_analysis_content
@@ -836,6 +877,7 @@ def analyze_non_url_qr(content: str) -> dict:
         "candidate_url_count": len(all_url_candidates),
         "structured_content": structured_content,
         "_embedded_body_urls": embedded_body_urls,
+        "_embedded_url_candidates": embedded_url_candidates,
         "social_engineering_categories": social_engineering_categories,
         "social_engineering_category_count": len(
             social_engineering_categories

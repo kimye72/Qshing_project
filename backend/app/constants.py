@@ -1,6 +1,12 @@
 RULESET_VERSION = "1.1"
 MAX_EMBEDDED_URLS_ANALYZED = 3
 MAX_URL_CANDIDATES = 10
+# Routing policy only: URL/non-URL score rules remain unchanged.
+EMBEDDED_URL_POLICY_VERSION = "2.0"
+ASSUMED_HTTPS_REASON = (
+    "스킴이 생략되어 HTTPS로 가정해 분석했습니다. "
+    "HTTPS 지원 여부나 실제 안전성이 확인된 것은 아닙니다."
+)
 
 PUNYCODE_HOSTNAME_SCORE = 15
 NONSTANDARD_PORT_SCORE = 10
