@@ -35,6 +35,187 @@ Finder textContaining(String text) =>
     find.textContaining(text, findRichText: true);
 
 void main() {
+  testWidgets('historical flag survives unknown source and absent counts', (
+    tester,
+  ) async {
+    final fields = historicalReport()..['vt_source'] = 'future_source';
+    final json = analysisResponse()
+      ..addAll(fields)
+      ..remove('vt_suspicious');
+    await showResult(tester, json);
+    expect(textContaining('외부 평판 조회 시간이 초과되었습니다.'), findsOneWidget);
+    expect(textContaining('평판 정보의 출처를 확인할 수 없습니다.'), findsOneWidget);
+    expect(textContaining('점수에 과거 평판 정보를 사용했습니다.'), findsOneWidget);
+    expect(textContaining('과거 악성 탐지 3건'), findsOneWidget);
+    expect(textContaining('과거 의심 탐지 수 확인 불가'), findsOneWidget);
+    expect(textContaining('악성 탐지 0건'), findsNothing);
+    expect(textContaining('의심 탐지 0건'), findsNothing);
+  });
+
+  testWidgets('cache miss and revalidation success show retrieval, not reuse', (
+    tester,
+  ) async {
+    for (final revalidated in [false, true]) {
+      for (final embedded in [false, true]) {
+        final fields = requestedReport(revalidated: revalidated);
+        await showResult(
+          tester,
+          embedded
+              ? withEmbeddedUrls([embeddedResponse()..addAll(fields)])
+              : (analysisResponse()..addAll(fields)),
+        );
+        expect(textContaining('이번 요청에서 외부 리포트를 조회했습니다.'), findsOneWidget);
+        expect(textContaining('리포트의 분석 시각은 조회 시각과 다를 수 있습니다.'), findsOneWidget);
+        expect(textContaining('저장된 평판 정보'), findsNothing);
+        expect(textContaining('방금'), findsNothing);
+        expect(textContaining('최신 리포트'), findsNothing);
+      }
+    }
+  });
+
+  testWidgets('explicit cached report shows reuse for parent and child', (
+    tester,
+  ) async {
+    for (final embedded in [false, true]) {
+      await showResult(
+        tester,
+        embedded
+            ? withEmbeddedUrls([embeddedResponse()..addAll(cachedReport())])
+            : (analysisResponse()..addAll(cachedReport())),
+      );
+      expect(textContaining('저장된 리포트를 재사용했습니다.'), findsOneWidget);
+      expect(textContaining('저장된 평판 정보이며 최신 상태와 다를 수 있습니다.'), findsOneWidget);
+      expect(textContaining('이번 요청에서 외부 리포트를 조회했습니다.'), findsNothing);
+    }
+  });
+
+  testWidgets(
+    'historical evidence displays failed lookup and past counts together',
+    (tester) async {
+      for (final embedded in [false, true]) {
+        await showResult(
+          tester,
+          embedded
+              ? withEmbeddedUrls([
+                  embeddedResponse()..addAll(historicalReport()),
+                ])
+              : (analysisResponse()..addAll(historicalReport())),
+        );
+        expect(textContaining('외부 평판 조회 시간이 초과되었습니다.'), findsOneWidget);
+        expect(textContaining('이번 외부 평판 조회는 완료되지 않았습니다.'), findsOneWidget);
+        expect(textContaining('점수에 과거 평판 정보를 사용'), findsOneWidget);
+        expect(textContaining('과거 악성 탐지 3건'), findsOneWidget);
+        expect(textContaining('과거 의심 탐지 2건'), findsOneWidget);
+        expect(textContaining('악성 탐지 0건'), findsNothing);
+        expect(textContaining('외부 평판 정보 있음'), findsNothing);
+        expect(
+          find.text('위험 점수 10'),
+          embedded ? findsNWidgets(2) : findsOneWidget,
+        );
+      }
+    },
+  );
+
+  testWidgets(
+    'each backend unavailable state has a public message, never zero detections',
+    (tester) async {
+      const messages = {
+        'lookup_failed': '외부 평판을 조회하지 못했습니다.',
+        'timeout': '외부 평판 조회 시간이 초과되었습니다.',
+        'budget_exhausted': '분석 시간 안에 외부 평판을 확인하지 못했습니다.',
+        'rate_limited': '외부 평판 조회가 일시적으로 제한되었습니다.',
+        'report_missing': '이 주소의 외부 평판 리포트가 없습니다.',
+        'submitted': '분석 요청이 접수되었지만 리포트는 아직 확인되지 않았습니다.',
+        'disabled': '외부 평판 조회를 사용하지 않았습니다.',
+        'future_state-secret': '평판 조회 상태를 확인할 수 없습니다.',
+      };
+      for (final entry in messages.entries) {
+        await showResult(
+          tester,
+          analysisResponse()..addAll({
+            'vt_lookup_status': entry.key,
+            'vt_source': entry.key == 'submitted' ? 'submitted_analysis' : null,
+            'error': 'secret exception',
+          }),
+        );
+        expect(textContaining(entry.value), findsOneWidget, reason: entry.key);
+        expect(textContaining('외부 평판 정보 있음'), findsNothing);
+        expect(textContaining('악성 탐지 0건'), findsNothing);
+        expect(textContaining('secret'), findsNothing);
+        expect(textContaining('조회 완료'), findsNothing);
+      }
+    },
+  );
+
+  testWidgets('old incomplete source/status/count metadata stays unknown', (
+    tester,
+  ) async {
+    final json = analysisResponse()
+      ..addAll({
+        'vt_available': true,
+        'revalidation_reason': 'cache_miss',
+        'cache_revalidated': false,
+      });
+    json.remove('vt_malicious');
+    json.remove('vt_suspicious');
+    await showResult(tester, json);
+    expect(textContaining('평판 조회 상태를 확인할 수 없습니다.'), findsOneWidget);
+    expect(textContaining('평판 정보의 출처를 확인할 수 없습니다.'), findsOneWidget);
+    expect(textContaining('악성 탐지 수 확인 불가'), findsOneWidget);
+    expect(textContaining('의심 탐지 수 확인 불가'), findsOneWidget);
+    expect(textContaining('악성 탐지 0건'), findsNothing);
+    expect(textContaining('저장된 평판 정보'), findsNothing);
+    expect(textContaining('조회 완료'), findsNothing);
+    json.remove('vt_available');
+    await showResult(tester, json);
+    expect(textContaining('조회 상태 확인 불가'), findsOneWidget);
+    expect(textContaining('외부 평판 정보 있음'), findsNothing);
+  });
+
+  testWidgets(
+    'each embedded card keeps its own source, lookup state and counts',
+    (tester) async {
+      final reports = [
+        requestedReport(),
+        cachedReport(),
+        historicalReport(status: 'rate_limited'),
+      ];
+      await showResult(
+        tester,
+        withEmbeddedUrls([
+          for (var index = 0; index < reports.length; index++)
+            embeddedResponse(url: 'https://link-$index.invalid')
+              ..addAll(reports[index]),
+        ])..addAll(historicalReport(status: 'disabled')),
+      );
+      const messages = [
+        '이번 요청에서 외부 리포트를 조회했습니다.',
+        '저장된 리포트를 재사용했습니다.',
+        '과거 악성 탐지 3건',
+      ];
+      for (var index = 0; index < reports.length; index++) {
+        final card = find.byKey(ValueKey('embedded-result-$index'));
+        expect(
+          find.descendant(of: card, matching: textContaining(messages[index])),
+          findsOneWidget,
+        );
+        for (var other = 0; other < reports.length; other++) {
+          if (other != index) {
+            expect(
+              find.descendant(
+                of: card,
+                matching: textContaining(messages[other]),
+              ),
+              findsNothing,
+            );
+          }
+        }
+      }
+      expect(textContaining('외부 평판 조회가 일시적으로 제한되었습니다.'), findsOneWidget);
+      expect(textContaining('외부 평판 조회를 사용하지 않았습니다.'), findsNothing);
+    },
+  );
+
   // Widget tests construct response fixtures directly. ScanPage is never
   // mounted, so the camera and analysis API cannot be invoked.
   testWidgets(
@@ -297,6 +478,7 @@ void main() {
         tester,
         withEmbeddedUrls([
           embeddedResponse(url: longUrl)
+            ..addAll(historicalReport())
             ..['reasons'] = ['긴 사유 ${'위험 신호를 확인했습니다. ' * 40}'],
         ]),
         textScale: 1.8,

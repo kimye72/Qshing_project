@@ -6,6 +6,169 @@ import 'package:qr_phishing_app/analysis_result.dart';
 import 'fixtures/analysis_responses.dart';
 
 void main() {
+  test('explicit unknown source does not hide affirmative historical use', () {
+    final json = historicalReport()..['vt_source'] = 'future_source';
+    final reputation = UrlReputation.fromJson(json);
+    expect(reputation.source, ReputationSource.unknown);
+    expect(reputation.historicalReputationUsed, isTrue);
+    expect(reputation.lookupStatus, ReputationLookupStatus.timeout);
+    expect(reputation.malicious, 3);
+  });
+
+  test(
+    'cache miss and successful revalidation retrieve a report this request',
+    () {
+      for (final revalidated in [false, true]) {
+        final reputation = UrlReputation.fromJson(
+          requestedReport(revalidated: revalidated),
+        );
+        expect(reputation.lookupStatus, ReputationLookupStatus.available);
+        expect(reputation.source, ReputationSource.requestedReport);
+        expect(reputation.availability, ReputationAvailability.available);
+      }
+    },
+  );
+
+  test(
+    'explicit source wins over cache metadata and unknown sources stay unknown',
+    () {
+      final json = requestedReport()..['cache_hit'] = true;
+      expect(
+        UrlReputation.fromJson(json).source,
+        ReputationSource.requestedReport,
+      );
+      json['vt_source'] = 'future_source';
+      expect(UrlReputation.fromJson(json).source, ReputationSource.unknown);
+      json['vt_source'] = 'cached_report';
+      expect(
+        UrlReputation.fromJson(json).source,
+        ReputationSource.storedReport,
+      );
+    },
+  );
+
+  test(
+    'failed revalidation retains historical counts and separate lookup state',
+    () {
+      for (final status in [
+        'timeout',
+        'rate_limited',
+        'lookup_failed',
+        'disabled',
+      ]) {
+        final reputation = UrlReputation.fromJson(
+          historicalReport(status: status),
+        );
+        expect(reputation.source, ReputationSource.historicalReport);
+        expect(reputation.availability, ReputationAvailability.unavailable);
+        expect(reputation.malicious, 3);
+        expect(reputation.suspicious, 2);
+      }
+      final json = historicalReport()..remove('analysis_flags');
+      expect(
+        UrlReputation.fromJson(json).source,
+        ReputationSource.historicalReport,
+      );
+    },
+  );
+
+  test(
+    'legacy fallback needs affirmative evidence, never a revalidation reason',
+    () {
+      final miss = requestedReport()..remove('vt_source');
+      expect(UrlReputation.fromJson(miss).source, ReputationSource.unknown);
+      miss['revalidation_reason'] = 'stale_cache';
+      expect(UrlReputation.fromJson(miss).source, ReputationSource.unknown);
+      final hit = cachedReport()..remove('vt_source');
+      expect(UrlReputation.fromJson(hit).source, ReputationSource.storedReport);
+      hit.remove('vt_lookup_status');
+      expect(UrlReputation.fromJson(hit).source, ReputationSource.storedReport);
+      hit['cache_revalidated'] = true;
+      expect(UrlReputation.fromJson(hit).source, ReputationSource.unknown);
+      final historical = historicalReport()..remove('vt_source');
+      expect(
+        UrlReputation.fromJson(historical).source,
+        ReputationSource.historicalReport,
+      );
+    },
+  );
+
+  test('actual lookup states are typed independently of report source', () {
+    const states = {
+      'lookup_failed': ReputationLookupStatus.lookupFailed,
+      'timeout': ReputationLookupStatus.timeout,
+      'budget_exhausted': ReputationLookupStatus.budgetExhausted,
+      'rate_limited': ReputationLookupStatus.rateLimited,
+      'report_missing': ReputationLookupStatus.reportMissing,
+      'submitted': ReputationLookupStatus.submitted,
+      'disabled': ReputationLookupStatus.disabled,
+      'future_state': ReputationLookupStatus.unknown,
+    };
+    for (final entry in states.entries) {
+      final reputation = UrlReputation.fromJson({
+        'vt_lookup_status': entry.key,
+        'vt_available': false,
+      });
+      expect(reputation.lookupStatus, entry.value);
+      expect(reputation.source, ReputationSource.unknown);
+      expect(reputation.malicious, isNull);
+    }
+  });
+
+  test('legacy submission acceptance never becomes a completed reputation', () {
+    for (final json in [
+      {'vt_available': true, 'vt_source': 'submitted_analysis'},
+      {'vt_available': true, 'vt_lookup_status': 'submitted'},
+    ]) {
+      final reputation = UrlReputation.fromJson(json);
+      expect(reputation.availability, ReputationAvailability.unavailable);
+      expect(reputation.source, ReputationSource.unknown);
+    }
+  });
+
+  test(
+    'missing and invalid metadata/counts never create a successful report',
+    () {
+      for (final json in [
+        <String, dynamic>{},
+        {
+          'vt_source': 1,
+          'vt_lookup_status': true,
+          'vt_malicious': '0',
+          'vt_suspicious': -1,
+        },
+      ]) {
+        final reputation = UrlReputation.fromJson(json);
+        expect(reputation.availability, ReputationAvailability.unknown);
+        expect(reputation.source, ReputationSource.unknown);
+        expect(reputation.lookupStatus, ReputationLookupStatus.unknown);
+        expect(reputation.malicious, isNull);
+        expect(reputation.suspicious, isNull);
+      }
+    },
+  );
+
+  test(
+    'parent and distinct children retain independent sources and counts',
+    () {
+      final result = AnalysisResult.fromJson(
+        withEmbeddedUrls([
+          embeddedResponse()..addAll(requestedReport()),
+          embeddedResponse()..addAll(cachedReport()),
+          embeddedResponse()..addAll(historicalReport()),
+        ])..addAll(requestedReport()),
+      );
+      expect(result.embeddedUrls.map((url) => url.reputation.source), [
+        ReputationSource.requestedReport,
+        ReputationSource.storedReport,
+        ReputationSource.historicalReport,
+      ]);
+      expect(result.reputation.malicious, 0);
+      expect(result.embeddedUrls.last.reputation.malicious, 3);
+      expect(result.showParentReputation, isFalse);
+    },
+  );
+
   test('UTF-8 JSON preserves backend score/status and nested URL metadata', () {
     final json = withEmbeddedUrls([
       {

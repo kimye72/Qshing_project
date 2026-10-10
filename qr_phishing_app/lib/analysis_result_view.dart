@@ -184,18 +184,45 @@ class AnalysisResultView extends StatelessWidget {
       ReputationAvailability.unavailable => '외부 평판 정보 없음',
       ReputationAvailability.unknown => '조회 상태 확인 불가',
     };
-    final lines = switch (reputation.availability) {
-      ReputationAvailability.available => [
-        reputation.malicious == null
-            ? '악성 탐지 수 확인 불가'
-            : '악성 탐지 ${reputation.malicious}건',
-        if (reputation.suspicious != null) '의심 탐지 ${reputation.suspicious}건',
-        if (reputation.fromCache) '저장된 평판 정보이며 최신 상태와 다를 수 있습니다.',
-        '외부 평판 정보는 실제 안전성을 보장하지 않습니다.',
-      ],
-      ReputationAvailability.unavailable => ['현재 확인한 정보만으로 평가한 결과입니다.'],
-      ReputationAvailability.unknown => ['이 응답에는 외부 평판 조회 상태가 제공되지 않았습니다.'],
+    final lookupMessage = switch (reputation.lookupStatus) {
+      ReputationLookupStatus.available => '외부 리포트 조회 완료',
+      ReputationLookupStatus.cached => '저장된 리포트를 재사용했습니다.',
+      ReputationLookupStatus.lookupFailed => '외부 평판을 조회하지 못했습니다.',
+      ReputationLookupStatus.timeout => '외부 평판 조회 시간이 초과되었습니다.',
+      ReputationLookupStatus.budgetExhausted => '분석 시간 안에 외부 평판을 확인하지 못했습니다.',
+      ReputationLookupStatus.rateLimited => '외부 평판 조회가 일시적으로 제한되었습니다.',
+      ReputationLookupStatus.reportMissing => '이 주소의 외부 평판 리포트가 없습니다.',
+      ReputationLookupStatus.submitted => '분석 요청이 접수되었지만 리포트는 아직 확인되지 않았습니다.',
+      ReputationLookupStatus.disabled => '외부 평판 조회를 사용하지 않았습니다.',
+      ReputationLookupStatus.unknown => '평판 조회 상태를 확인할 수 없습니다.',
     };
+    final sourceMessage = switch (reputation.source) {
+      ReputationSource.requestedReport =>
+        '이번 요청에서 외부 리포트를 조회했습니다. 리포트의 분석 시각은 조회 시각과 다를 수 있습니다.',
+      ReputationSource.storedReport => '저장된 평판 정보이며 최신 상태와 다를 수 있습니다.',
+      ReputationSource.historicalReport =>
+        '이번 외부 평판 조회는 완료되지 않았습니다. 점수에 과거 평판 정보를 사용했으며 최신 상태와 다를 수 있습니다.',
+      ReputationSource.unknown => '평판 정보의 출처를 확인할 수 없습니다.',
+    };
+    final historical = reputation.historicalReputationUsed;
+    final lines = [
+      lookupMessage,
+      sourceMessage,
+      if (historical && reputation.source != ReputationSource.historicalReport)
+        '점수에 과거 평판 정보를 사용했습니다. 이번 조회의 완료 여부는 조회 상태 안내를 확인하세요.',
+      if (reputation.availability == ReputationAvailability.available ||
+          historical) ...[
+        reputation.malicious == null
+            ? '${historical ? '과거 ' : ''}악성 탐지 수 확인 불가'
+            : '${historical ? '과거 ' : ''}악성 탐지 ${reputation.malicious}건',
+        reputation.suspicious == null
+            ? '${historical ? '과거 ' : ''}의심 탐지 수 확인 불가'
+            : '${historical ? '과거 ' : ''}의심 탐지 ${reputation.suspicious}건',
+      ],
+      if (reputation.availability == ReputationAvailability.unavailable)
+        '현재 확인한 정보만으로 평가한 결과입니다.',
+      '외부 평판 정보는 실제 안전성을 보장하지 않습니다.',
+    ];
     return _notice(Icons.info_outline_rounded, '$title\n${lines.join('\n')}');
   }
 

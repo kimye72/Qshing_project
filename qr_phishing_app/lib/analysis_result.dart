@@ -2,29 +2,104 @@ import 'dart:convert';
 
 enum ReputationAvailability { available, unavailable, unknown }
 
+enum ReputationLookupStatus {
+  available,
+  cached,
+  lookupFailed,
+  timeout,
+  budgetExhausted,
+  rateLimited,
+  reportMissing,
+  submitted,
+  disabled,
+  unknown,
+}
+
+enum ReputationSource {
+  requestedReport,
+  storedReport,
+  historicalReport,
+  unknown,
+}
+
 // Preserve missing fields as unknown; never turn a missing VT count into zero.
 class UrlReputation {
   final bool? available;
   final int? malicious;
   final int? suspicious;
-  final bool fromCache;
+  final ReputationLookupStatus lookupStatus;
+  final ReputationSource source;
+  final bool historicalReputationUsed;
 
   const UrlReputation({
     this.available,
     this.malicious,
     this.suspicious,
-    this.fromCache = false,
+    this.lookupStatus = ReputationLookupStatus.unknown,
+    this.source = ReputationSource.unknown,
+    this.historicalReputationUsed = false,
   });
 
-  factory UrlReputation.fromJson(Map<String, dynamic> json) => UrlReputation(
-    available: _optionalBool(json['vt_available']),
-    malicious: _optionalCount(json['vt_malicious']),
-    suspicious: _optionalCount(json['vt_suspicious']),
-    fromCache:
-        json['cache_hit'] == true ||
-        (json['revalidation_reason'] != null &&
-            json['cache_revalidated'] == false),
-  );
+  factory UrlReputation.fromJson(Map<String, dynamic> json) {
+    final lookupStatus = switch (json['vt_lookup_status']) {
+      'available' => ReputationLookupStatus.available,
+      'cached' => ReputationLookupStatus.cached,
+      'lookup_failed' => ReputationLookupStatus.lookupFailed,
+      'timeout' => ReputationLookupStatus.timeout,
+      'budget_exhausted' => ReputationLookupStatus.budgetExhausted,
+      'rate_limited' => ReputationLookupStatus.rateLimited,
+      'report_missing' => ReputationLookupStatus.reportMissing,
+      'submitted' => ReputationLookupStatus.submitted,
+      'disabled' => ReputationLookupStatus.disabled,
+      _ => ReputationLookupStatus.unknown,
+    };
+    final historical =
+        _object(json['analysis_flags'])?['historical_reputation_used'] == true;
+    final available = _optionalBool(json['vt_available']);
+    final source = switch (json['vt_source']) {
+      'url_report' => ReputationSource.requestedReport,
+      'cached_report' =>
+        historical ||
+                (available == false &&
+                    lookupStatus != ReputationLookupStatus.unknown &&
+                    lookupStatus != ReputationLookupStatus.cached &&
+                    lookupStatus != ReputationLookupStatus.available)
+            ? ReputationSource.historicalReport
+            : ReputationSource.storedReport,
+      // Compatibility: only affirmative historical/cache evidence may infer
+      // a missing source. Revalidation reasons (including cache_miss) never do.
+      null =>
+        historical
+            ? ReputationSource.historicalReport
+            : available == true &&
+                  (lookupStatus == ReputationLookupStatus.cached ||
+                      (json['cache_hit'] == true &&
+                          json['cache_revalidated'] != true &&
+                          lookupStatus == ReputationLookupStatus.unknown))
+            ? ReputationSource.storedReport
+            : ReputationSource.unknown,
+      _ => ReputationSource.unknown,
+    };
+    // Submission acceptance and failed lookups cannot become completed reports,
+    // even if an older response incorrectly marks them available.
+    final failedLookup = switch (lookupStatus) {
+      ReputationLookupStatus.available ||
+      ReputationLookupStatus.cached ||
+      ReputationLookupStatus.unknown => false,
+      _ => true,
+    };
+    return UrlReputation(
+      available: failedLookup || json['vt_source'] == 'submitted_analysis'
+          ? false
+          : available,
+      malicious: _optionalCount(json['vt_malicious']),
+      suspicious: _optionalCount(json['vt_suspicious']),
+      lookupStatus: lookupStatus,
+      source: source,
+      historicalReputationUsed:
+          historical || source == ReputationSource.historicalReport,
+    );
+  }
 
   ReputationAvailability get availability => switch (available) {
     true => ReputationAvailability.available,
