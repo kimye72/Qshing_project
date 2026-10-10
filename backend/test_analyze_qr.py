@@ -179,6 +179,9 @@ def make_cache_item(url: str, *, checked_at: int, **updates) -> dict:
         "vt_undetected": result["vt_undetected"],
         "analyzed_at": checked_at,
         "last_checked_at": checked_at,
+        # Model an established direct history unless a test requests pending
+        # state. Legacy missing-field behavior is covered by consecutive tests.
+        "direct_history_initialized": True,
     }
     if "direct_history_initialized" in updates:
         item["direct_history_initialized"] = updates[
@@ -1263,7 +1266,6 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
             state["item"]["scan_count"] = state["item"].get("scan_count", 0) + 1
             state["item"].setdefault("first_seen_at", scanned_at)
             state["item"]["last_scanned_at"] = scanned_at
-            state["item"]["direct_history_initialized"] = True
 
         with (
             patch.object(url_cache, "URL_CACHE_ENABLED", True),
@@ -1283,6 +1285,8 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
                 side_effect=record_scan,
             ),
             patch("app.main.analyze_url", side_effect=make_url_result) as analyzer,
+            patch("app.main.mark_direct_url_history_saved", side_effect=lambda _url:
+                  state["item"].update(direct_history_initialized=True)),
             patch(
                 "app.main.save_scan_result",
                 return_value=make_db_result(),
@@ -2267,7 +2271,6 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
         def record_scan(_url_hash, *, scanned_at):
             state["item"]["scan_count"] = state["item"].get("scan_count", 0) + 1
             state["item"]["last_scanned_at"] = scanned_at
-            state["item"]["direct_history_initialized"] = True
 
         with (
             patch.object(url_cache, "URL_CACHE_ENABLED", True),
@@ -2288,6 +2291,8 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
                 side_effect=record_scan,
             ),
             patch("app.main.analyze_url", side_effect=make_url_result) as analyzer_mock,
+            patch("app.main.mark_direct_url_history_saved", side_effect=lambda _url:
+                  state["item"].update(direct_history_initialized=True)),
             patch(
                 "app.main.save_scan_result",
                 return_value=make_db_result(),
@@ -2546,6 +2551,9 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
             self.assertTrue(kwargs["increment_scan"])
             now = kwargs["now_epoch"]
             state["item"] = make_cache_item(url, checked_at=now)
+            state["item"]["direct_history_initialized"] = kwargs[
+                "direct_history_initialized"
+            ]
             state["item"].update(
                 {
                     "scan_count": 1,
@@ -2576,6 +2584,8 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
                 side_effect=record_scan,
             ),
             patch("app.main.analyze_url", side_effect=make_url_result) as analyzer,
+            patch("app.main.mark_direct_url_history_saved", side_effect=lambda _url:
+                  state["item"].update(direct_history_initialized=True)),
             patch(
                 "app.main.save_scan_result",
                 return_value=make_db_result(),
@@ -3004,6 +3014,7 @@ class UrlRulesetCacheTests(unittest.TestCase):
             }),
             patch.object(url_cache, "record_cached_url_scan"),
             patch("app.main.save_scan_result", return_value=make_db_result()),
+            patch("app.main.mark_direct_url_history_saved"),
         )
         for setting in settings:
             setting.start()
@@ -3350,15 +3361,14 @@ class UrlCacheTests(unittest.TestCase):
         expression = table.update["UpdateExpression"]
         self.assertIn("if_not_exists(#first_seen_at, :scanned_at)", expression)
         self.assertIn("ADD #scan_count :one", expression)
-        self.assertIn(
-            "#direct_history_initialized = :direct_history_initialized",
-            expression,
+        self.assertNotIn("direct_history_initialized", expression)
+        self.assertNotIn(
+            "direct_history_initialized", table.update["ExpressionAttributeNames"].values()
         )
         self.assertEqual(
             table.update["ExpressionAttributeValues"],
             {
                 ":scanned_at": 1100,
-                ":direct_history_initialized": True,
                 ":one": 1,
             },
         )
@@ -3379,7 +3389,7 @@ class UrlCacheTests(unittest.TestCase):
         self.scan_record_mock.assert_not_called()
         save_mock.assert_called_once()
         self.assertTrue(save_mock.call_args.kwargs["increment_scan"])
-        self.assertTrue(
+        self.assertFalse(
             save_mock.call_args.kwargs["direct_history_initialized"]
         )
         self.assertFalse(result["cache_hit"])

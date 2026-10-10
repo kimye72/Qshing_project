@@ -284,22 +284,42 @@ def record_cached_url_scan(url_hash: str, *, scanned_at: int) -> None:
         Key={"url_hash": url_hash},
         UpdateExpression=(
             "SET #first_seen_at = if_not_exists(#first_seen_at, :scanned_at), "
-            "#last_scanned_at = :scanned_at, "
-            "#direct_history_initialized = :direct_history_initialized "
+            "#last_scanned_at = :scanned_at "
             "ADD #scan_count :one"
         ),
         ExpressionAttributeNames={
             "#first_seen_at": "first_seen_at",
             "#last_scanned_at": "last_scanned_at",
-            "#direct_history_initialized": "direct_history_initialized",
             "#scan_count": "scan_count",
         },
         ExpressionAttributeValues={
             ":scanned_at": int(scanned_at),
-            ":direct_history_initialized": True,
             ":one": 1,
         },
     )
+
+
+def mark_direct_url_history_saved(url: str) -> None:
+    """Acknowledge a successful history write without affecting that success.
+
+    The cache SDK uses the remaining request budget; no retry or extra read is
+    performed. A missing cache item must not be recreated as a metadata-only item.
+    """
+    if not URL_CACHE_ENABLED:
+        return
+    try:
+        _get_cache_table().update_item(
+            Key={"url_hash": build_url_hash(url)},
+            UpdateExpression="SET #direct_history_initialized = :completed",
+            ConditionExpression="attribute_exists(#url_hash)",
+            ExpressionAttributeNames={
+                "#url_hash": "url_hash",
+                "#direct_history_initialized": "direct_history_initialized",
+            },
+            ExpressionAttributeValues={":completed": True},
+        )
+    except Exception as exc:
+        logger.warning("URL history cache acknowledgement failed: %s", type(exc).__name__)
 
 
 def update_cache_check_time(
@@ -464,11 +484,17 @@ def _with_context_history_policy(
     analysis_context: Literal["direct", "embedded"],
     should_save: bool,
     event_type: str | None,
+    cache_url: str | None = None,
 ) -> dict[str, Any]:
     if analysis_context == "embedded":
         result.pop("_history_should_save", None)
         result.pop("_history_event_type", None)
+        result.pop("_history_cache_url", None)
         return result
+    if should_save and cache_url is not None:
+        # Carry the exact cache key input, not a parent QR's first embedded URL.
+        # persist_scan_history removes this private field before DB/API output.
+        result["_history_cache_url"] = cache_url
     return _with_history_policy(
         result,
         should_save=should_save,
@@ -625,9 +651,7 @@ def analyze_url_with_cache(
                 vt_checked_at=vt_checked_at,
                 increment_scan=is_direct,
                 direct_history_initialized=(
-                    True
-                    if is_direct
-                    else False if cached is None else None
+                    False if is_direct or cached is None else None
                 ),
             )
         return _with_context_history_policy(
@@ -645,13 +669,14 @@ def analyze_url_with_cache(
                 if lookup_failed or cached is not None
                 else "initial_analysis"
             ),
+            cache_url=url,
         )
 
     age = get_cache_age_seconds(cached, now_epoch=now)
     ruleset_matches = cached.get("ruleset_version") == RULESET_VERSION
     url_hash = cached["url_hash"]
     needs_initial_history = (
-        is_direct and cached.get("direct_history_initialized") is False
+        is_direct and cached.get("direct_history_initialized") is not True
     )
     scan_recorded = _try_record_scan(url_hash, now) if is_direct else True
     if ruleset_matches and is_cache_fresh(cached, now_epoch=now):
@@ -670,6 +695,7 @@ def analyze_url_with_cache(
             analysis_context=analysis_context,
             should_save=should_save,
             event_type=event_type,
+            cache_url=url,
         )
 
     reason = "stale_cache" if ruleset_matches else "ruleset_changed"
@@ -693,6 +719,7 @@ def analyze_url_with_cache(
             analysis_context=analysis_context,
             should_save=should_save,
             event_type=event_type,
+            cache_url=url,
         )
 
     result = _analyze_current_url(url, analyzer)
@@ -715,6 +742,7 @@ def analyze_url_with_cache(
             analysis_context=analysis_context,
             should_save=should_save,
             event_type=event_type,
+            cache_url=url,
         )
 
     if not ruleset_matches and not has_current_vt_report and _has_historical_vt_result(cached):
@@ -753,6 +781,7 @@ def analyze_url_with_cache(
             analysis_context=analysis_context,
             should_save=should_save,
             event_type=event_type,
+            cache_url=url,
         )
 
     risk_changed = _risk_changed(cached, result)
@@ -791,4 +820,5 @@ def analyze_url_with_cache(
         analysis_context=analysis_context,
         should_save=should_save,
         event_type=event_type,
+        cache_url=url,
     )

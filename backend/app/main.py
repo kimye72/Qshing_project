@@ -32,7 +32,9 @@ from app.services.qr_analyzer import (
 )
 from app.services.scanner import analyze_url
 from app.services.analysis_budget import request_budget
-from app.services.url_cache import UrlAnalysisUnavailableError, analyze_url_with_cache
+from app.services.url_cache import (
+    UrlAnalysisUnavailableError, analyze_url_with_cache, mark_direct_url_history_saved,
+)
 
 
 APP_VERSION = "0.4.0"
@@ -161,6 +163,7 @@ def persist_scan_history(result: dict) -> dict:
     )
     should_save = bool(result.pop("_history_should_save", True))
     event_type = result.pop("_history_event_type", None)
+    history_cache_url = result.pop("_history_cache_url", None)
 
     result["history_saved"] = None
     result["history_event_type"] = None
@@ -191,6 +194,9 @@ def persist_scan_history(result: dict) -> dict:
     if history_policy_applies:
         persisted_result["history_saved"] = bool(persisted_result["db_saved"])
         persisted_result["history_event_type"] = event_type
+
+    if persisted_result["db_saved"] and history_cache_url is not None:
+        mark_direct_url_history_saved(history_cache_url)
 
     return persisted_result
 
