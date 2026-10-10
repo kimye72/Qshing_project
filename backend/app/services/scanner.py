@@ -16,6 +16,7 @@ from app.services.virustotal import get_url_report
 DANGEROUS_SCHEMES = {"javascript", "data", "file", "ftp"}
 ALLOWED_SCHEMES = {"http", "https"}
 SHORTENER_DOMAINS = {
+    "naver.me",
     "bit.ly",
     "tinyurl.com",
     "t.co",
@@ -58,8 +59,8 @@ SQL_XSS_PATTERNS = [
 # Generic words such as pay/bank are not identifiers of a particular brand.
 BRAND_KEYWORDS = ["naver", "kakao", "google", "apple", "paypal"]
 BRAND_SAFE_DOMAINS = {
-    "naver": ["naver.com", "www.naver.com"],
-    "kakao": ["kakao.com", "www.kakao.com", "kakaocorp.com"],
+    "naver": ["naver.com", "www.naver.com", "naver.me"],
+    "kakao": ["kakao.com", "www.kakao.com", "kakaocorp.com", "kakaopay.com"],
     "google": ["google.com", "www.google.com", "google.co.kr"],
     "apple": ["apple.com", "www.apple.com"],
     "paypal": ["paypal.com", "www.paypal.com"],
@@ -260,6 +261,7 @@ def _get_local_heuristic_score(url: str, domain: str, decoded_url: str) -> tuple
         risk_score += 20
         flags["shortener"] = True
         reasons.append("단축 URL 서비스를 사용하고 있습니다.")
+        reasons.append("단축 URL의 최종 목적지는 확인하지 않았습니다.")
 
     if _has_suspicious_brand_domain(hostname):
         risk_score += 15

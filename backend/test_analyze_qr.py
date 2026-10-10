@@ -3076,7 +3076,7 @@ class UrlRulesetCacheTests(unittest.TestCase):
                     analysis_context=context,
                 )
                 analyzer.assert_called_once_with("https://wooribank.com")
-                self.assertEqual(result["ruleset_version"], "1.2")
+                self.assertEqual(result["ruleset_version"], RULESET_VERSION)
                 self.assertEqual(result["final_score"], 20)
                 self.assertEqual(result["status"], "safe")
                 self.assertFalse(result["cache_hit"])
@@ -3084,7 +3084,7 @@ class UrlRulesetCacheTests(unittest.TestCase):
                 self.assertEqual(result["revalidation_reason"], "ruleset_changed")
                 self.save.assert_called_once()
                 saved = self.save.call_args.args[1]
-                self.assertEqual((saved["ruleset_version"], saved["final_score"]), ("1.2", 20))
+                self.assertEqual((saved["ruleset_version"], saved["final_score"]), (RULESET_VERSION, 20))
                 self.assertEqual(cached["ruleset_version"], "1.1")
                 self.assertEqual(cached["final_score"], 35)
 
@@ -3103,11 +3103,11 @@ class UrlRulesetCacheTests(unittest.TestCase):
                 )
                 analyzer.assert_not_called()
                 self.assertTrue(result["cache_hit"])
-                self.assertEqual((result["ruleset_version"], result["final_score"]), ("1.2", 20))
+                self.assertEqual((result["ruleset_version"], result["final_score"]), (RULESET_VERSION, 20))
         self.save.assert_not_called()
 
     def test_missing_or_invalid_cache_versions_require_calculation(self):
-        for version in (None, "", 1.2):
+        for version in (None, "", float(RULESET_VERSION)):
             for context in ("direct", "embedded"):
                 with self.subTest(version=version, context=context):
                     cached = self.old_wooribank_cache()
@@ -3122,7 +3122,7 @@ class UrlRulesetCacheTests(unittest.TestCase):
                         analysis_context=context,
                     )
                     analyzer.assert_called_once()
-                    self.assertEqual((result["ruleset_version"], result["final_score"]), ("1.2", 20))
+                    self.assertEqual((result["ruleset_version"], result["final_score"]), (RULESET_VERSION, 20))
                     self.assertEqual(result["revalidation_reason"], "ruleset_changed")
 
     def test_recalculation_failure_never_returns_or_relabels_old_cache(self):
@@ -3184,7 +3184,7 @@ class UrlRulesetCacheTests(unittest.TestCase):
                 previous_item=self.old_wooribank_cache(),
             )
         values = table.update_item.call_args.kwargs["ExpressionAttributeValues"]
-        self.assertEqual(values[":ruleset_version"], "1.2")
+        self.assertEqual(values[":ruleset_version"], RULESET_VERSION)
         self.assertEqual(values[":final_score"], 20)
         self.assertEqual(values[":previous_score"], 35)
         self.assertEqual(values[":previous_status"], "warning")
@@ -3195,7 +3195,7 @@ class UrlRulesetCacheTests(unittest.TestCase):
         analyzer = Mock(wraps=analyze_url)
         for _ in range(2):
             result = url_cache.analyze_url_with_cache("https://wooribank.com", analyzer=analyzer)
-            self.assertEqual((result["ruleset_version"], result["final_score"]), ("1.2", 20))
+            self.assertEqual((result["ruleset_version"], result["final_score"]), (RULESET_VERSION, 20))
             self.assertFalse(result["cache_hit"])
         self.assertEqual(analyzer.call_count, 2)
         self.assertEqual(self.cached.return_value["ruleset_version"], "1.1")
@@ -3209,7 +3209,7 @@ class UrlRulesetCacheTests(unittest.TestCase):
         )
         self.cached.return_value = cached
         result = url_cache.analyze_url_with_cache("https://wooribank.com", analyzer=analyze_url)
-        self.assertEqual((result["ruleset_version"], result["local_score"]), ("1.2", 20))
+        self.assertEqual((result["ruleset_version"], result["local_score"]), (RULESET_VERSION, 20))
         self.assertEqual((result["vt_score_delta"], result["final_score"]), (70, 90))
         self.assertFalse(result["analysis_flags"]["suspicious_brand_domain"])
         self.assertFalse(result["cache_revalidated"])
@@ -3232,9 +3232,9 @@ class UrlRulesetCacheTests(unittest.TestCase):
                     response = client.post(path, json=payload)
                     self.assertEqual(response.status_code, 200)
                     result = response.json()
-                    self.assertEqual(result["ruleset_version"], "1.2")
+                    self.assertEqual(result["ruleset_version"], RULESET_VERSION)
                     scored = result["embedded_url_results"][0] if embedded else result
-                    self.assertEqual((scored["ruleset_version"], scored["final_score"]), ("1.2", 20))
+                    self.assertEqual((scored["ruleset_version"], scored["final_score"]), (RULESET_VERSION, 20))
                     self.assertEqual(scored["revalidation_reason"], "ruleset_changed")
                     if embedded:
                         self.assertEqual(result["final_score"], max(result["text_score"], 20))
@@ -3256,14 +3256,14 @@ class UrlRulesetCacheTests(unittest.TestCase):
                     result = response.json()
                     child = result["embedded_url_results"][0]
                     self.assertTrue(child["cache_hit"])
-                    self.assertEqual(child["ruleset_version"], "1.2")
+                    self.assertEqual(child["ruleset_version"], RULESET_VERSION)
                     self.assertEqual(child["assumed_https"], candidate)
                     self.assertEqual(child["original_candidates"], ["wooribank.com"] if candidate else [])
                     self.assertEqual(child["original_url"], "wooribank.com" if candidate else "https://wooribank.com")
                     self.assertEqual(ASSUMED_HTTPS_REASON in child["reasons"], candidate)
                 direct = client.post("/scan", json={"url": "https://wooribank.com"}).json()
                 self.assertTrue(direct["cache_hit"])
-                self.assertEqual((direct["ruleset_version"], direct["final_score"]), ("1.2", 20))
+                self.assertEqual((direct["ruleset_version"], direct["final_score"]), (RULESET_VERSION, 20))
                 self.assertNotIn(ASSUMED_HTTPS_REASON, direct["reasons"])
         self.assertNotIn(ASSUMED_HTTPS_REASON, cached["reasons"])
         self.assertNotIn("assumed_https", cached)
@@ -3304,12 +3304,12 @@ class UrlRulesetCacheTests(unittest.TestCase):
             response = client.post("/analyze-qr", json={"content": "SMS:recipient:body"})
         self.assertEqual(response.status_code, 200)
         result = response.json()
-        self.assertEqual((result["ruleset_version"], result["final_score"]), ("1.2", 55))
+        self.assertEqual((result["ruleset_version"], result["final_score"]), (RULESET_VERSION, 55))
         self.assertEqual(result["text_score"], 55)
         self.assertEqual(result["embedded_url_max_score"], 10)
         self.assertEqual(result["analyzed_embedded_url_count"], 1)
         self.assertFalse(result["embedded_url_analysis_complete"])
-        self.assertEqual(result["embedded_url_results"][0]["ruleset_version"], "1.2")
+        self.assertEqual(result["embedded_url_results"][0]["ruleset_version"], RULESET_VERSION)
         self.assertEqual(result["embedded_url_failures"][0]["error_code"], "EMBEDDED_URL_ANALYSIS_FAILED")
         self.assertNotIn("secret-key", response.text)
         self.assertEqual(cached["ruleset_version"], "1.1")
@@ -3989,7 +3989,7 @@ class UrlReasonConsistencyTests(unittest.TestCase):
         supplied = scanner.analyze_url_with_vt_result(url, report)
         self.assertEqual(staged, supplied)
         self.assertNotIn(self.LEGACY_REASON, staged["reasons"])
-        self.assertEqual(staged["ruleset_version"], "1.2")
+        self.assertEqual(staged["ruleset_version"], RULESET_VERSION)
         return staged
 
     def legacy_cache(self, *, checked_at=1000, **updates):
@@ -4090,7 +4090,7 @@ class UrlReasonConsistencyTests(unittest.TestCase):
                     self.assertEqual((result["final_score"], result["status"]), (score, status))
                     self.assertEqual(result["reasons"][0], self.LOCAL_REASON)
                     self.assertEqual(result["vt_source"], "url_report")
-                    self.assertEqual(result["ruleset_version"], "1.2")
+                    self.assertEqual(result["ruleset_version"], RULESET_VERSION)
                 self.assertEqual(parent["risk_score"], max(parent["text_score"], score))
                 self.assertTrue(parent["embedded_url_analysis_complete"])
                 self.assertEqual(child["analysis_url"], self.URL)
@@ -4170,11 +4170,280 @@ class UrlReasonConsistencyTests(unittest.TestCase):
         with patch.object(url_cache, "URL_CACHE_ENABLED", True):
             result = self.api(self.URL, direct_scan=True)
         self.assertEqual((result["local_score"], result["vt_score_delta"], result["final_score"]), (10, 70, 80))
-        self.assertEqual(result["ruleset_version"], "1.2")
+        self.assertEqual(result["ruleset_version"], RULESET_VERSION)
         self.assertEqual(result["vt_lookup_status"], "rate_limited")
         self.assertTrue(result["analysis_flags"]["historical_reputation_used"])
         for fragment in (self.LOCAL_REASON, "조회 결과 미사용", "악성 3건", "재조회는 완료하지 못했습니다"):
             self.assertTrue(any(fragment in reason for reason in result["reasons"]), fragment)
+
+
+class OfficialBrandDomain13Tests(unittest.TestCase):
+    CASES = (
+        ("https://kakaopay.com", 10, "safe", False),
+        ("https://naver.me/AbCd1234", 30, "warning", True),
+    )
+    BRAND_REASON = "유명 서비스명을 포함하지만 공식 도메인으로 보기 어려운 주소입니다."
+    SHORTENER_REASON = "단축 URL 서비스를 사용하고 있습니다."
+    DESTINATION_REASON = "단축 URL의 최종 목적지는 확인하지 않았습니다."
+
+    def setUp(self):
+        settings = (
+            ("vt", patch.object(scanner, "get_url_report", return_value={
+                "enabled": False, "available": False, "lookup_status": "disabled",
+            })),
+            (None, patch.object(url_cache, "URL_CACHE_ENABLED", False)),
+            (None, patch.object(url_cache, "URL_CACHE_FRESHNESS_SECONDS", 100)),
+            (None, patch.object(url_cache, "_utc_epoch_seconds", return_value=1000)),
+            ("lookup", patch.object(url_cache, "get_cached_url_analysis", return_value=None)),
+            ("write", patch.object(url_cache, "save_cached_url_analysis")),
+            (None, patch.object(url_cache, "record_cached_url_scan")),
+            ("history", patch.object(main, "save_scan_result", return_value=make_db_result())),
+            (None, patch.object(main, "mark_direct_url_history_saved")),
+        )
+        for name, setting in settings:
+            active = setting.start()
+            self.addCleanup(setting.stop)
+            if name:
+                setattr(self, name, active)
+
+    def old_cache(self, url, *, version="1.2", malicious=0):
+        delta = 70 if malicious == 3 else 0
+        fields = {
+            "domain": url.split("://", 1)[1].split("/", 1)[0],
+            "ruleset_version": version, "local_score": 25,
+            "vt_score_delta": delta, "final_score": 25 + delta, "risk_score": 25 + delta,
+            "status": "danger" if delta else "safe",
+            "reasons": [self.BRAND_REASON],
+            "analysis_flags": {"suspicious_brand_domain": True, "shortener": False},
+            "vt_available": bool(malicious), "vt_malicious": malicious,
+            "vt_source": "url_report" if malicious else None,
+            "vt_lookup_status": "available" if malicious else "disabled",
+        }
+        if malicious:
+            fields["reasons"].append("VirusTotal 탐지 결과 악성 3건, 의심 0건이 확인되었습니다.")
+        cached = make_cache_item(url, checked_at=990, **fields)
+        if version is None:
+            cached.pop("ruleset_version")
+        if malicious:
+            cached["vt_checked_at"] = 900
+        return cached
+
+    def assert_official_result(self, result, score, status, shortener):
+        self.assertEqual((result["final_score"], result["status"]), (score, status))
+        self.assertEqual(result["ruleset_version"], "1.3")
+        self.assertFalse(result["analysis_flags"]["suspicious_brand_domain"])
+        self.assertNotIn(self.BRAND_REASON, result["reasons"])
+        self.assertEqual(result["analysis_flags"]["shortener"], shortener)
+        if shortener:
+            self.assertIn(self.SHORTENER_REASON, result["reasons"])
+            self.assertIn(self.DESTINATION_REASON, result["reasons"])
+
+    def test_official_domains_have_expected_local_scores_and_reasons(self):
+        self.assertEqual(RULESET_VERSION, "1.3")
+        for url, score, status, shortener in self.CASES:
+            with self.subTest(url=url):
+                result = analyze_url(url)
+                self.assert_official_result(result, score, status, shortener)
+                self.assertEqual(result["local_score"], score)
+                self.assertEqual(result["vt_score_delta"], 0)
+                self.assertFalse(result["vt_available"])
+                expected = [self.SHORTENER_REASON, self.DESTINATION_REASON] if shortener else [scanner.LOCAL_NO_ADDITIONAL_RISK_REASON]
+                self.assertEqual(result["reasons"], expected)
+
+    def test_host_case_trailing_dot_and_real_subdomains(self):
+        for host, score, status, shortener in (
+            ("KAKAOPAY.COM", 10, "safe", False),
+            ("www.kakaopay.com.", 10, "safe", False),
+            ("m.kakaopay.com", 10, "safe", False),
+            ("NAVER.ME", 30, "warning", True),
+            ("www.naver.me.", 30, "warning", True),
+        ):
+            with self.subTest(host=host):
+                self.assert_official_result(analyze_url("https://" + host), score, status, shortener)
+
+    def test_deceptive_hosts_and_path_names_do_not_inherit_exceptions(self):
+        for host in (
+            "kakaopay.com.evil.invalid", "fakekakaopay.invalid",
+            "notkakaopay.com", "naver.me.evil.invalid", "fakenaver.me", "naver.mee",
+        ):
+            with self.subTest(host=host):
+                result = analyze_url("https://" + host)
+                self.assertTrue(result["analysis_flags"]["suspicious_brand_domain"])
+                self.assertIn(self.BRAND_REASON, result["reasons"])
+                self.assertFalse(result["analysis_flags"]["shortener"])
+        for url in (
+            "https://fakekakaopay.invalid/kakaopay.com",
+            "https://fakenaver.invalid/?next=https://naver.me/AbCd1234",
+        ):
+            result = analyze_url(url)
+            self.assertTrue(result["analysis_flags"]["suspicious_brand_domain"])
+            self.assertFalse(result["analysis_flags"]["shortener"])
+
+    def test_http_userinfo_sql_xss_and_port_signals_on_official_hosts(self):
+        for host, base in (("kakaopay.com", 10), ("naver.me", 30)):
+            for url, extra, flag in (
+                ("http://" + host, 20, "non_https"),
+                ("https://user@" + host, 25, "userinfo_in_url"),
+                ("https://" + host + "/?q=%3Cscript%3E", 15, "sql_xss_pattern_count"),
+                ("https://" + host + "/union/select", 20, "sql_xss_pattern_count"),
+                ("https://" + host + ":8443", 10, "nonstandard_port"),
+            ):
+                with self.subTest(url=url):
+                    result = analyze_url(url)
+                    self.assertEqual(result["local_score"], base + extra)
+                    self.assertTrue(result["analysis_flags"][flag])
+                    self.assertFalse(result["analysis_flags"]["suspicious_brand_domain"])
+                    self.assertNotIn(self.BRAND_REASON, result["reasons"])
+
+    def test_vt_detection_and_scoped_local_reasons_are_preserved(self):
+        report = UrlReasonConsistencyTests.report()
+        self.vt.return_value = report
+        for url, local, _, shortener in self.CASES:
+            result = analyze_url(url)
+            self.assert_official_result(result, min(local + 70, 100), "danger", shortener)
+            self.assertEqual(result["local_score"], local)
+            self.assertEqual(result["vt_score_delta"], 70)
+            self.assertEqual(result["vt_malicious"], 3)
+            self.assertEqual(result["vt_source"], "url_report")
+            self.assertTrue(any("악성 3건" in reason for reason in result["reasons"]))
+            self.assertNotIn("특별한 위험 요소가 발견되지 않았습니다.", result["reasons"])
+            self.assertEqual(result, analyze_url_with_vt_result(url, report))
+
+    def test_existing_shorteners_keep_their_scores_and_original_reason(self):
+        for host in ("bit.ly", "tinyurl.com", "t.co", "goo.gl", "is.gd", "ow.ly", "buff.ly", "cutt.ly", "shorturl.at"):
+            result = analyze_url("https://" + host + "/AbCd1234")
+            self.assertEqual((result["local_score"], result["status"]), (30, "warning"))
+            self.assertTrue(result["analysis_flags"]["shortener"])
+            self.assertIn(self.SHORTENER_REASON, result["reasons"])
+
+    def test_direct_sms_and_text_api_apply_rules_and_preserve_assumptions(self):
+        with TestClient(main.app) as client:
+            for url, score, status, shortener in self.CASES:
+                candidate = url.removeprefix("https://")
+                for path, content, embedded, assumed in (
+                    ("/scan", url, False, False),
+                    ("/analyze-qr", url, False, False),
+                    ("/analyze-qr", "확인: " + url, True, False),
+                    ("/analyze-qr", "확인: " + candidate, True, True),
+                    ("/analyze-qr", "SMSTO:01012345678:확인 " + candidate, True, True),
+                    ("/analyze-qr", "sms:01012345678?body=" + url, True, False),
+                ):
+                    with self.subTest(path=path, content=content):
+                        response = client.post(path, json={"url" if path == "/scan" else "content": content})
+                        self.assertEqual(response.status_code, 200, response.text)
+                        parent = response.json()
+                        result = parent["embedded_url_results"][0] if embedded else parent
+                        self.assert_official_result(result, score, status, shortener)
+                        if embedded:
+                            self.assertEqual(parent["risk_score"], max(parent["text_score"], score))
+                            self.assertTrue(parent["embedded_url_analysis_complete"])
+                            self.assertEqual(result["assumed_https"], assumed)
+                            self.assertEqual(result["original_candidates"], [candidate] if assumed else [])
+                            self.assertEqual(result["analysis_url"], url)
+
+    def test_old_and_missing_cache_versions_recalculate_in_both_contexts(self):
+        with patch.object(url_cache, "URL_CACHE_ENABLED", True):
+            for url, score, status, shortener in self.CASES:
+                for version in ("1.2", None):
+                    for context in ("direct", "embedded"):
+                        with self.subTest(url=url, version=version, context=context):
+                            cached = self.old_cache(url, version=version)
+                            before = copy.deepcopy(cached)
+                            self.lookup.return_value = cached
+                            self.write.reset_mock()
+                            analyzer = Mock(wraps=analyze_url)
+                            result = url_cache.analyze_url_with_cache(url, analyzer=analyzer, analysis_context=context)
+                            analyzer.assert_called_once_with(url)
+                            self.assert_official_result(result, score, status, shortener)
+                            self.assertEqual(result["revalidation_reason"], "ruleset_changed")
+                            self.assertFalse(result["cache_hit"])
+                            saved = self.write.call_args.args[1]
+                            self.assertEqual((saved["ruleset_version"], saved["final_score"]), ("1.3", score))
+                            self.assertEqual(cached, before)
+                            if context == "direct":
+                                self.assertTrue(result["_history_should_save"])
+                                self.assertEqual(result["_history_event_type"], "ruleset_reclassified")
+                            else:
+                                self.assertNotIn("_history_should_save", result)
+
+    def test_current_cache_reuse_and_request_specific_https_metadata(self):
+        with patch.object(url_cache, "URL_CACHE_ENABLED", True), TestClient(main.app) as client:
+            for url, score, status, shortener in self.CASES:
+                current = analyze_url(url)
+                cached = make_cache_item(url, checked_at=990, **{key: current[key] for key in url_cache._CACHE_RESULT_FIELDS})
+                self.lookup.return_value = cached
+                self.vt.reset_mock()
+                self.write.reset_mock()
+                with patch.object(main, "analyze_url", side_effect=AssertionError("current cache must be reused")):
+                    for content, assumed in (("확인 " + url.removeprefix("https://"), True), ("확인 " + url, False)):
+                        response = client.post("/analyze-qr", json={"content": content})
+                        self.assertEqual(response.status_code, 200)
+                        child = response.json()["embedded_url_results"][0]
+                        self.assert_official_result(child, score, status, shortener)
+                        self.assertTrue(child["cache_hit"])
+                        self.assertEqual(child["assumed_https"], assumed)
+                        self.assertEqual(ASSUMED_HTTPS_REASON in child["reasons"], assumed)
+                    direct = client.post("/scan", json={"url": url}).json()
+                    self.assert_official_result(direct, score, status, shortener)
+                    self.assertTrue(direct["cache_hit"])
+                    self.assertEqual(direct["history_skip_reason"], "duplicate_unchanged")
+                self.vt.assert_not_called()
+                self.write.assert_not_called()
+                self.assertNotIn(ASSUMED_HTTPS_REASON, cached["reasons"])
+
+    def test_recalculation_failure_preserves_old_cache_and_partial_qr_result(self):
+        cached = self.old_cache(self.CASES[0][0])
+        self.lookup.return_value = cached
+        before = copy.deepcopy(cached)
+        with patch.object(url_cache, "URL_CACHE_ENABLED", True), TestClient(main.app) as client:
+            with patch.object(main, "analyze_url", side_effect=RuntimeError("secret internal failure")):
+                for path in ("/scan", "/analyze-qr"):
+                    response = client.post(path, json={"url" if path == "/scan" else "content": self.CASES[0][0]})
+                    self.assertEqual(response.status_code, 503)
+                    self.assertEqual(set(response.json()), {"detail"})
+                    self.assertNotIn("secret", response.text)
+            self.write.assert_not_called()
+            old_naver = self.old_cache(self.CASES[1][0])
+            self.lookup.side_effect = lambda url: cached if "kakaopay.com" in url else old_naver
+            def analyze(url):
+                if "kakaopay.com" in url:
+                    raise RuntimeError("secret internal failure")
+                return analyze_url(url)
+            with patch.object(main, "analyze_url", side_effect=analyze):
+                response = client.post("/analyze-qr", json={"content": "SMSTO:01012345678:확인 kakaopay.com https://naver.me/AbCd1234"})
+            self.assertEqual(response.status_code, 200)
+            parent = response.json()
+            self.assertFalse(parent["embedded_url_analysis_complete"])
+            self.assertEqual(parent["analyzed_embedded_url_count"], 1)
+            self.assertEqual(parent["final_score"], max(parent["text_score"], 30))
+            self.assert_official_result(parent["embedded_url_results"][0], 30, "warning", True)
+            self.assertEqual(parent["embedded_url_failures"][0]["error_code"], "EMBEDDED_URL_ANALYSIS_FAILED")
+            self.assertTrue(parent["embedded_url_failures"][0]["assumed_https"])
+            self.assertNotIn("secret", response.text)
+        self.assertEqual(cached, before)
+
+    def test_old_reputation_is_combined_with_new_local_rules_and_history_event(self):
+        with patch.object(url_cache, "URL_CACHE_ENABLED", True), TestClient(main.app) as client:
+            for url, local, _, shortener in self.CASES:
+                cached = self.old_cache(url, malicious=3)
+                before = copy.deepcopy(cached)
+                self.lookup.return_value = cached
+                response = client.post("/scan", json={"url": url})
+                self.assertEqual(response.status_code, 200)
+                result = response.json()
+                self.assert_official_result(result, min(local + 70, 100), "danger", shortener)
+                self.assertEqual((result["local_score"], result["vt_score_delta"]), (local, 70))
+                self.assertFalse(result["vt_available"])
+                self.assertEqual(result["vt_lookup_status"], "disabled")
+                self.assertEqual(result["vt_source"], "cached_report")
+                self.assertEqual(result["vt_malicious"], 3)
+                self.assertTrue(result["analysis_flags"]["historical_reputation_used"])
+                self.assertTrue(any("재조회는 완료하지 못했습니다" in reason for reason in result["reasons"]))
+                self.assertNotIn("특별한 위험 요소가 발견되지 않았습니다.", result["reasons"])
+                self.assertEqual(result["history_event_type"], "ruleset_reclassified")
+                self.assertTrue(result["history_saved"])
+                self.assertEqual(self.write.call_args.kwargs["vt_checked_at"], 900)
+                self.assertEqual(cached, before)
 
 
 if __name__ == "__main__":

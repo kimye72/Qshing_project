@@ -161,7 +161,7 @@ class DirectUrlHistoryTests(unittest.TestCase):
         self.assertEqual(self.item()["scan_count"], 3)
         self.assertEqual(self.vt.call_count, 1)
         self.assertEqual(first["risk_score"], second["risk_score"])
-        self.assertEqual(second["ruleset_version"], "1.2")
+        self.assertEqual(second["ruleset_version"], RULESET_VERSION)
 
     def test_embedded_cache_then_failed_direct_history_is_retried(self):
         parent = main.analyze_qr(QRAnalyzeRequest(content="확인: example.com/"))
@@ -319,7 +319,7 @@ class DirectUrlHistoryTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertNotIn("_history_cache_url", response.text)
             self.assertNotIn("offline failure", response.text)
-            self.assertEqual(response.json()["ruleset_version"], "1.2")
+            self.assertEqual(response.json()["ruleset_version"], RULESET_VERSION)
         self.assertFalse(first.json()["history_saved"])
         self.assertTrue(second.json()["history_saved"])
         self.assertEqual(third.json()["history_skip_reason"], "duplicate_unchanged")
