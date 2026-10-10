@@ -15,14 +15,12 @@ Future<void> showResult(
     MaterialApp(
       theme: ThemeData(useMaterial3: true, colorSchemeSeed: AppColors.accent),
       home: Scaffold(
+        bottomNavigationBar: ScanAgainButton(onPressed: onRescan ?? () {}),
         body: MediaQuery(
           data: MediaQueryData(textScaler: TextScaler.linear(textScale)),
           child: SizedBox(
             height: 240,
-            child: AnalysisResultView(
-              result: AnalysisResult.fromJson(json),
-              onRescan: onRescan ?? () {},
-            ),
+            child: AnalysisResultView(result: AnalysisResult.fromJson(json)),
           ),
         ),
       ),

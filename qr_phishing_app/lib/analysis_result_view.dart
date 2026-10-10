@@ -2,13 +2,8 @@ part of 'main.dart';
 
 class AnalysisResultView extends StatelessWidget {
   final AnalysisResult result;
-  final VoidCallback onRescan;
 
-  const AnalysisResultView({
-    super.key,
-    required this.result,
-    required this.onRescan,
-  });
+  const AnalysisResultView({super.key, required this.result});
 
   @override
   Widget build(BuildContext context) {
@@ -100,25 +95,6 @@ class AnalysisResultView extends StatelessWidget {
               _failedResult(result.embeddedFailures[index], index),
             ],
           ],
-          const SizedBox(height: 16),
-          SizedBox(
-            width: double.infinity,
-            child: FilledButton.icon(
-              onPressed: onRescan,
-              icon: const Icon(Icons.qr_code_scanner_rounded, size: 18),
-              label: const Padding(
-                padding: EdgeInsets.symmetric(vertical: 14),
-                child: Text('다시 스캔하기'),
-              ),
-              style: FilledButton.styleFrom(
-                backgroundColor: AppColors.accent,
-                foregroundColor: Colors.white,
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12),
-                ),
-              ),
-            ),
-          ),
         ],
       ),
     );
