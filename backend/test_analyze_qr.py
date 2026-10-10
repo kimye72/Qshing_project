@@ -1,3 +1,4 @@
+import copy
 import unittest
 from decimal import Decimal
 from unittest.mock import Mock, patch
@@ -3937,6 +3938,243 @@ class UrlCacheTests(unittest.TestCase):
         self.assertFalse(result["cache_revalidated"])
         self.assertEqual(save_mock.call_args.kwargs["last_checked_at"], 800)
         self.assertFalse(result["_history_should_save"])
+
+
+class UrlReasonConsistencyTests(unittest.TestCase):
+    URL = "https://example.com/Path?Token=AbC"
+    CANDIDATE = "example.com/Path?Token=AbC"
+    LEGACY_REASON = "특별한 위험 요소가 발견되지 않았습니다."
+    LOCAL_REASON = "로컬 URL 구조 규칙에서 추가 위험 신호가 발견되지 않았습니다."
+
+    @staticmethod
+    def report(malicious=3, suspicious=0):
+        return {
+            "enabled": True, "available": True,
+            "lookup_status": "available", "source": "url_report",
+            "stats": {
+                "malicious": malicious, "suspicious": suspicious,
+                "harmless": 1, "undetected": 10,
+            },
+        }
+
+    def setUp(self):
+        self.cache_table = Mock()
+        self.cache_table.get_item.return_value = {}
+        self.history_table = Mock()
+
+        def table(name):
+            if name == url_cache.URL_CACHE_TABLE_NAME:
+                return self.cache_table
+            self.assertEqual(name, database.DYNAMODB_TABLE_NAME)
+            return self.history_table
+
+        settings = (
+            patch.object(url_cache, "URL_CACHE_ENABLED", False),
+            patch.object(url_cache, "URL_CACHE_FRESHNESS_SECONDS", 100),
+            patch.object(url_cache, "_utc_epoch_seconds", return_value=1000),
+            patch.object(database, "DYNAMODB_ENABLED", True),
+            patch.object(database.boto3, "resource", return_value=Mock(Table=table)),
+            patch.object(scanner, "get_url_report", return_value=self.report()),
+        )
+        for setting in settings:
+            active = setting.start()
+            self.addCleanup(setting.stop)
+            if setting is settings[-1]:
+                self.vt = active
+
+    def consistent_analysis(self, report, url=None):
+        url = url or self.URL
+        self.vt.return_value = report
+        staged = scanner.analyze_url(url)
+        supplied = scanner.analyze_url_with_vt_result(url, report)
+        self.assertEqual(staged, supplied)
+        self.assertNotIn(self.LEGACY_REASON, staged["reasons"])
+        self.assertEqual(staged["ruleset_version"], "1.2")
+        return staged
+
+    def legacy_cache(self, *, checked_at=1000, **updates):
+        result = scanner.analyze_url_with_vt_result(self.URL, self.report())
+        # Reproduce the old persisted reasons rather than fixing the fixture.
+        result["reasons"] = [self.LEGACY_REASON] + [
+            reason for reason in result["reasons"] if reason != self.LOCAL_REASON
+        ]
+        fields = {key: result[key] for key in url_cache._CACHE_RESULT_FIELDS}
+        fields.update(updates)
+        cached = make_cache_item(self.URL, checked_at=checked_at, **fields)
+        self.cache_table.get_item.return_value = {"Item": cached}
+        return cached
+
+    def api(self, content, *, direct_scan=False):
+        with TestClient(main.app) as client:
+            response = client.post(
+                "/scan" if direct_scan else "/analyze-qr",
+                json={"url" if direct_scan else "content": content},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertNotIn(self.LEGACY_REASON, response.text)
+        return response.json()
+
+    def test_no_local_signals_with_malicious_report_keeps_80_danger(self):
+        result = self.consistent_analysis(self.report())
+        self.assertEqual(
+            (result["local_score"], result["vt_score_delta"], result["final_score"], result["status"]),
+            (10, 70, 80, "danger"),
+        )
+        self.assertEqual(result["reasons"][0], self.LOCAL_REASON)
+        self.assertTrue(any("악성 3건, 의심 0건" in reason for reason in result["reasons"]))
+
+    def test_suspicious_report_preserves_warning_scores(self):
+        for suspicious, score in ((1, 35), (2, 55)):
+            with self.subTest(suspicious=suspicious):
+                result = self.consistent_analysis(self.report(0, suspicious))
+                self.assertEqual((result["final_score"], result["status"]), (score, "warning"))
+                self.assertEqual(result["vt_suspicious"], suspicious)
+                self.assertTrue(any("의심" in reason for reason in result["reasons"][1:]))
+
+    def test_local_risk_and_external_detection_reasons_are_preserved(self):
+        result = self.consistent_analysis(self.report(), "http://example.com/login")
+        self.assertEqual((result["local_score"], result["vt_score_delta"], result["final_score"]), (40, 70, 100))
+        self.assertIn("HTTPS가 아닌 HTTP 주소입니다.", result["reasons"])
+        self.assertIn("의심 키워드 포함: login", result["reasons"])
+        self.assertNotIn(self.LOCAL_REASON, result["reasons"])
+        self.assertTrue(any("악성 3건" in reason for reason in result["reasons"]))
+
+    def test_zero_detection_report_and_unavailable_reputation_stay_distinct(self):
+        clean = self.consistent_analysis(self.report(0, 0))
+        self.assertTrue(clean["vt_available"])
+        self.assertEqual(clean["vt_lookup_status"], "available")
+        self.assertTrue(any("악성 탐지 수가 0건" in reason for reason in clean["reasons"]))
+        for status in ("disabled", "lookup_failed", "timeout", "rate_limited", "report_missing"):
+            with self.subTest(status=status):
+                report = {
+                    "enabled": status != "disabled", "available": False,
+                    "lookup_status": status, "error": "외부 평판 정보를 확인하지 못했습니다.",
+                }
+                result = self.consistent_analysis(report)
+                self.assertEqual((result["final_score"], result["status"]), (10, "safe"))
+                self.assertFalse(result["vt_available"])
+                self.assertEqual(result["vt_lookup_status"], status)
+                self.assertIn(self.LOCAL_REASON, result["reasons"])
+                self.assertFalse(any("악성 탐지 수가 0건" in reason for reason in result["reasons"]))
+                if report["enabled"]:
+                    self.assertTrue(any("조회 결과 미사용" in reason for reason in result["reasons"]))
+
+    def test_lookup_exception_preserves_local_work_and_public_failure_reason(self):
+        self.vt.side_effect = RuntimeError("secret internal exception")
+        result = scanner.analyze_url(self.URL)
+        self.assertEqual(result["final_score"], 10)
+        self.assertFalse(result["vt_available"])
+        self.assertEqual(result["vt_lookup_status"], "lookup_failed")
+        self.assertIn(self.LOCAL_REASON, result["reasons"])
+        self.assertNotIn("secret", str(result))
+        self.assertTrue(any("조회 결과 미사용" in reason for reason in result["reasons"]))
+
+    def test_combining_legacy_local_result_scopes_reason_without_mutating_input(self):
+        local = scanner.analyze_url_with_vt_result(self.URL, {"enabled": False, "available": False})
+        local["reasons"] = [self.LEGACY_REASON]
+        before = copy.deepcopy(local)
+        result = scanner.apply_vt_to_local_result(local, self.report())
+        self.assertEqual((result["final_score"], result["status"]), (80, "danger"))
+        self.assertEqual(result["reasons"][0], self.LOCAL_REASON)
+        self.assertNotIn(self.LEGACY_REASON, result["reasons"])
+        self.assertEqual(local, before)
+
+    def test_live_direct_and_embedded_api_serialization(self):
+        for report, score, status in ((self.report(), 80, "danger"), (self.report(0, 1), 35, "warning")):
+            with self.subTest(score=score):
+                self.vt.return_value = report
+                direct = self.api(self.URL, direct_scan=True)
+                parent = self.api("확인: " + self.CANDIDATE)
+                child = parent["embedded_url_results"][0]
+                for result in (direct, child):
+                    self.assertEqual((result["final_score"], result["status"]), (score, status))
+                    self.assertEqual(result["reasons"][0], self.LOCAL_REASON)
+                    self.assertEqual(result["vt_source"], "url_report")
+                    self.assertEqual(result["ruleset_version"], "1.2")
+                self.assertEqual(parent["risk_score"], max(parent["text_score"], score))
+                self.assertTrue(parent["embedded_url_analysis_complete"])
+                self.assertEqual(child["analysis_url"], self.URL)
+                self.assertEqual(child["original_candidates"], [self.CANDIDATE])
+                self.assertTrue(child["assumed_https"])
+                self.assertTrue(any("HTTPS로 가정" in reason for reason in child["reasons"]))
+
+    def test_legacy_cache_direct_and_body_api_reasons_without_cache_rewrite(self):
+        cached = self.legacy_cache()
+        before = copy.deepcopy(cached)
+        with patch.object(url_cache, "URL_CACHE_ENABLED", True):
+            for content, direct_scan, embedded in (
+                (self.URL, True, False), (self.URL, False, False),
+                ("확인: " + self.CANDIDATE, False, True),
+                ("SMSTO:01012345678:확인: " + self.CANDIDATE, False, True),
+                ("mailto:reader@example.org?body=" + self.CANDIDATE, False, True),
+            ):
+                with self.subTest(content=content):
+                    parent = self.api(content, direct_scan=direct_scan)
+                    result = parent["embedded_url_results"][0] if embedded else parent
+                    self.assertEqual((result["final_score"], result["status"]), (80, "danger"))
+                    self.assertEqual(result["reasons"][0], self.LOCAL_REASON)
+                    self.assertTrue(any("악성 3건" in reason for reason in result["reasons"]))
+                    self.assertTrue(result["cache_hit"])
+                    self.assertEqual(result["vt_source"], "cached_report")
+                    if embedded:
+                        self.assertTrue(result["assumed_https"])
+                    else:
+                        self.assertEqual(parent["history_skip_reason"], "duplicate_unchanged")
+        self.vt.assert_not_called()
+        self.assertEqual(cached, before)
+        # Only the three parent QR requests write histories; cached direct
+        # requests retain the unchanged-result skip policy.
+        self.assertEqual(self.history_table.put_item.call_count, 3)
+
+    def test_fresh_local_only_cache_scopes_old_reason_without_claiming_report(self):
+        cached = make_cache_item(self.URL, checked_at=1000, vt_lookup_status="disabled")
+        self.cache_table.get_item.return_value = {"Item": cached}
+        with patch.object(url_cache, "URL_CACHE_ENABLED", True):
+            result = self.api(self.URL, direct_scan=True)
+        self.assertEqual((result["final_score"], result["status"]), (10, "safe"))
+        self.assertEqual(result["reasons"], [self.LOCAL_REASON])
+        self.assertFalse(result["vt_available"])
+        self.assertEqual(result["vt_lookup_status"], "disabled")
+        self.vt.assert_not_called()
+        self.assertEqual(cached["reasons"], [self.LEGACY_REASON])
+
+    def test_failed_revalidation_preserves_past_risk_in_direct_and_embedded_api(self):
+        cached = self.legacy_cache(checked_at=800)
+        before = copy.deepcopy(cached)
+        self.vt.return_value = {
+            "enabled": True, "available": False, "lookup_status": "timeout",
+            "error": "외부 평판 조회 시간이 초과되었습니다.",
+        }
+        with patch.object(url_cache, "URL_CACHE_ENABLED", True), patch.object(url_cache, "_virustotal_is_configured", return_value=True):
+            for content, direct_scan in ((self.URL, True), ("확인: " + self.CANDIDATE, False)):
+                parent = self.api(content, direct_scan=direct_scan)
+                result = parent if direct_scan else parent["embedded_url_results"][0]
+                self.assertEqual((result["final_score"], result["status"]), (80, "danger"))
+                self.assertIn(self.LOCAL_REASON, result["reasons"])
+                self.assertTrue(any("악성 3건" in reason for reason in result["reasons"]))
+                self.assertTrue(any("재조회는 완료하지 못했습니다" in reason for reason in result["reasons"]))
+                self.assertFalse(result["vt_available"])
+                self.assertEqual(result["vt_lookup_status"], "timeout")
+                self.assertEqual(result["vt_source"], "cached_report")
+                self.assertEqual(result["vt_malicious"], 3)
+                self.assertTrue(result["analysis_flags"]["historical_reputation_used"])
+        self.assertEqual(cached, before)
+        self.assertEqual(self.vt.call_count, 2)
+
+    def test_old_ruleset_recalculation_keeps_failure_and_historical_risk_reasons(self):
+        self.legacy_cache(checked_at=800, ruleset_version="1.1")
+        self.vt.return_value = {
+            "enabled": True, "available": False, "lookup_status": "rate_limited",
+            "error": "외부 평판 조회가 일시적으로 제한되었습니다.",
+        }
+        with patch.object(url_cache, "URL_CACHE_ENABLED", True):
+            result = self.api(self.URL, direct_scan=True)
+        self.assertEqual((result["local_score"], result["vt_score_delta"], result["final_score"]), (10, 70, 80))
+        self.assertEqual(result["ruleset_version"], "1.2")
+        self.assertEqual(result["vt_lookup_status"], "rate_limited")
+        self.assertTrue(result["analysis_flags"]["historical_reputation_used"])
+        for fragment in (self.LOCAL_REASON, "조회 결과 미사용", "악성 3건", "재조회는 완료하지 못했습니다"):
+            self.assertTrue(any(fragment in reason for reason in result["reasons"]), fragment)
 
 
 if __name__ == "__main__":

@@ -65,6 +65,19 @@ BRAND_SAFE_DOMAINS = {
     "paypal": ["paypal.com", "www.paypal.com"],
 }
 
+LOCAL_NO_ADDITIONAL_RISK_REASON = (
+    "로컬 URL 구조 규칙에서 추가 위험 신호가 발견되지 않았습니다."
+)
+
+
+def normalize_url_reasons(reasons: list[str]) -> list[str]:
+    """Scope legacy no-risk wording without removing other analysis evidence."""
+    return [
+        LOCAL_NO_ADDITIONAL_RISK_REASON
+        if reason == "특별한 위험 요소가 발견되지 않았습니다." else reason
+        for reason in reasons
+    ]
+
 
 def _decode_repeatedly(value: str, max_rounds: int = 3) -> tuple[str, bool]:
     """URL 인코딩을 제한된 횟수만큼 해제합니다."""
@@ -326,6 +339,8 @@ def analyze_url_with_vt_result(url: str, vt_result: dict) -> dict:
     decoded_url, _ = _decode_repeatedly(url)
 
     local_score, reasons, flags = _get_local_heuristic_score(url, domain, decoded_url)
+    if not reasons:
+        reasons.append(LOCAL_NO_ADDITIONAL_RISK_REASON)
 
     score_with_vt = _apply_virustotal_score(local_score, reasons, vt_result)
     vt_score_delta = score_with_vt - local_score
@@ -333,9 +348,6 @@ def analyze_url_with_vt_result(url: str, vt_result: dict) -> dict:
 
     status, message = _make_status_and_message(risk_score)
     vt_dashboard_fields = _extract_vt_dashboard_fields(vt_result)
-
-    if not reasons:
-        reasons.append("특별한 위험 요소가 발견되지 않았습니다.")
 
     return {
         "url": url,
@@ -368,7 +380,7 @@ def apply_vt_to_local_result(local_result: dict, vt_result: dict) -> dict:
     """Combine reputation with already completed local work, without rerunning it."""
     result = dict(local_result)
     result["raw_result"] = dict(local_result.get("raw_result") or {})
-    reasons = list(result["reasons"])
+    reasons = normalize_url_reasons(result["reasons"])
     score_with_vt = _apply_virustotal_score(result["local_score"], reasons, vt_result)
     final_score = min(score_with_vt, 100)
     status, message = _make_status_and_message(final_score)

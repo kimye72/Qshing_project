@@ -21,6 +21,7 @@ from app.services.scanner import (
     _decode_repeatedly,
     analyze_url,
     apply_vt_to_local_result,
+    normalize_url_reasons,
 )
 
 
@@ -417,7 +418,7 @@ def _restore_cached_result(url: str, item: dict[str, Any]) -> dict[str, Any]:
         "ruleset_version": item["ruleset_version"],
         "status": item.get("status"),
         "message": item.get("message", ""),
-        "reasons": list(item.get("reasons") or []),
+        "reasons": normalize_url_reasons(item.get("reasons") or []),
         "analysis_flags": dict(item.get("analysis_flags") or {}),
         "vt_available": bool(item.get("vt_available", False)),
         "vt_lookup_status": "cached" if item.get("vt_available") else item.get("vt_lookup_status"),
