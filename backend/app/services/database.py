@@ -24,6 +24,63 @@ SCAN_RESULT_TTL_DAYS = int(os.getenv("SCAN_RESULT_TTL_DAYS", "90"))
 DEFAULT_SCAN_SOURCE = os.getenv("DEFAULT_SCAN_SOURCE", "mobile_app")
 DATABASE_ERROR = "DATABASE_ERROR"
 
+# Explicit projections of EmbeddedUrlResult / EmbeddedUrlFailure in schemas.py.
+# Never persist a whole analyzer result or raw external response as a child.
+_EMBEDDED_URL_TARGET_FIELDS = (
+    "original_url", "original_candidates", "analysis_url", "assumed_https",
+)
+_EMBEDDED_URL_RESULT_FIELDS = _EMBEDDED_URL_TARGET_FIELDS + (
+    "url", "domain", "local_score", "vt_score_delta", "final_score", "risk_score",
+    "status", "reasons", "analysis_flags", "ruleset_version", "vt_available",
+    "vt_lookup_status", "vt_source", "vt_malicious", "vt_suspicious",
+    "vt_harmless", "vt_undetected", "cache_hit", "cache_age_seconds",
+    "cache_revalidated", "revalidation_reason",
+)
+_EMBEDDED_URL_FAILURE_FIELDS = _EMBEDDED_URL_TARGET_FIELDS + ("error_code",)
+_EMBEDDED_URL_FLAG_FIELDS = frozenset({
+    "decoded_changed", "non_https", "disallowed_scheme", "ip_address_host",
+    "private_or_local_host", "long_url", "shortener", "userinfo_in_url",
+    "suspicious_keyword_count", "low_confidence_keyword_count",
+    "sql_xss_pattern_count", "suspicious_brand_domain", "punycode_hostname",
+    "nonstandard_port", "explicit_port", "excessive_hostname_labels",
+    "hostname_label_count", "historical_reputation_used", "analysis_budget_exhausted",
+})
+
+
+def _select_embedded_entries(entries: Any, fields: tuple[str, ...]) -> list | None:
+    """Keep provided public fields; missing detail must not become an empty list."""
+    if not isinstance(entries, list):
+        return None
+    selected = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        public = {field: entry[field] for field in fields if field in entry}
+        if "analysis_flags" in public:
+            flags = public["analysis_flags"]
+            public["analysis_flags"] = {
+                name: value for name, value in flags.items()
+                if name in _EMBEDDED_URL_FLAG_FIELDS
+                and (value is None or isinstance(value, (bool, int, float, Decimal)))
+            } if isinstance(flags, dict) else None
+        selected.append(public)
+    return selected
+
+
+def _embedded_history_details(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Do not infer historic completion, reputation or policy from current defaults."""
+    complete = item.get("embedded_url_analysis_complete")
+    return {
+        "embedded_url_results": _select_embedded_entries(
+            item.get("embedded_url_results"), _EMBEDDED_URL_RESULT_FIELDS,
+        ),
+        "embedded_url_failures": _select_embedded_entries(
+            item.get("embedded_url_failures"), _EMBEDDED_URL_FAILURE_FIELDS,
+        ),
+        "embedded_url_analysis_complete": complete if isinstance(complete, bool) else None,
+        "embedded_url_policy_version": item.get("embedded_url_policy_version"),
+    }
+
 
 def _get_table():
     """DynamoDB 테이블 객체를 생성합니다."""
@@ -71,11 +128,10 @@ def _make_dashboard_item(item: Dict[str, Any]) -> Dict[str, Any]:
     raw_result = safe_item.get("raw_result") or {}
     vt = raw_result.get("virustotal") or {}
     stats = vt.get("stats") or {}
-    analysis_flags = (
-        safe_item.get("analysis_flags")
-        or raw_result.get("analysis_flags")
-        or {}
-    )
+    analysis_flags = safe_item.get("analysis_flags")
+    if not isinstance(analysis_flags, dict):
+        analysis_flags = raw_result.get("analysis_flags") or {}
+    embedded_details = _embedded_history_details(safe_item)
 
     return {
         "scan_id": safe_item.get("scan_id"),
@@ -108,6 +164,11 @@ def _make_dashboard_item(item: Dict[str, Any]) -> Dict[str, Any]:
         "embedded_url_count": safe_item.get("embedded_url_count", 0),
         "analyzed_embedded_url_count": safe_item.get("analyzed_embedded_url_count", 0),
         "embedded_url_max_score": safe_item.get("embedded_url_max_score"),
+        **embedded_details,
+        "embedded_url_details_available": (
+            embedded_details["embedded_url_results"] is not None
+            and embedded_details["embedded_url_failures"] is not None
+        ),
         "url": safe_item.get("url"),
         "domain": safe_item.get("domain") or raw_result.get("domain"),
         "local_score": safe_item.get("local_score"),
@@ -208,6 +269,7 @@ def save_scan_result(result: Dict[str, Any]) -> Dict[str, Any]:
         "revalidation_reason": result.get("revalidation_reason"),
         "raw_result": result.get("raw_result", {}),
     }
+    item.update(_embedded_history_details(result))
 
     item = {key: value for key, value in item.items() if value is not None}
 

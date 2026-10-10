@@ -2755,7 +2755,7 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
 
         self.assertEqual(table.item["history_event_type"], "risk_changed")
 
-    def test_text_with_url_db_stores_summary_without_embedded_results(self):
+    def test_text_with_url_db_stores_summary_and_public_embedded_results(self):
         class CapturingTable:
             item = None
 
@@ -2790,7 +2790,9 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
         self.assertEqual(table.item["embedded_url_count"], 1)
         self.assertEqual(table.item["analyzed_embedded_url_count"], 1)
         self.assertEqual(table.item["embedded_url_max_score"], 55)
-        self.assertNotIn("embedded_url_results", table.item)
+        self.assertEqual(table.item["embedded_url_results"][0]["final_score"], 55)
+        self.assertEqual(table.item["embedded_url_results"][0]["url"], "https://example.com")
+        self.assertNotIn("raw_result", table.item["embedded_url_results"][0])
         self.assertNotIn("extracted_urls", table.item)
 
     def test_candidate_db_stores_only_summary_metadata(self):
