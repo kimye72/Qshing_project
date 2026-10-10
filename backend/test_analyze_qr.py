@@ -118,6 +118,23 @@ def make_db_result() -> dict:
     }
 
 
+def make_history_metadata(limit=20):
+    return {
+        "scope": "latest_saved_history", "count_unit": "stored_history_records",
+        "requested_limit": limit, "returned_count": 0, "status_filter": None,
+        "query_complete": True, "pages_read": 1, "evaluated_items": 0,
+        "matching_records_count": 0,
+        "ordering": "created_at_desc_scan_id_desc",
+        "read_consistency": "strong_per_item_not_snapshot",
+        "bounds": {
+            "time_budget_seconds": database.HISTORY_READ_BUDGET_SECONDS,
+            "max_pages": database.HISTORY_MAX_PAGES,
+            "max_evaluated_items": database.HISTORY_MAX_EVALUATED_ITEMS,
+            "page_evaluation_limit": database.HISTORY_PAGE_EVALUATION_LIMIT,
+        },
+    }
+
+
 def make_vt_url_result(
     url: str,
     *,
@@ -2904,7 +2921,7 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
 
             def scan(self, **kwargs):
                 self.scan_kwargs = kwargs
-                return {"Items": []}
+                return {"Items": [], "ScannedCount": 0}
 
         table = EmptyTable()
         with (
@@ -2913,7 +2930,8 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
         ):
             database.list_scan_results(limit=200)
 
-        self.assertEqual(table.scan_kwargs["Limit"], 200)
+        self.assertEqual(table.scan_kwargs["Limit"], database.HISTORY_PAGE_EVALUATION_LIMIT)
+        self.assertTrue(table.scan_kwargs["ConsistentRead"])
 
     def test_mangum_handler_remains_configured(self):
         self.assertIsNotNone(main.handler)
@@ -2925,9 +2943,10 @@ class AdminEndpointSecurityTests(unittest.TestCase):
         self.admin_key = "unit-test-admin-key"
 
     def test_scans_accepts_correct_admin_key(self):
+        expected = {"items": [], "metadata": make_history_metadata()}
         with (
             patch.object(main, "ADMIN_API_KEY", self.admin_key),
-            patch("app.main.list_scan_results", return_value=[]) as list_mock,
+            patch("app.main.get_recent_scan_history", return_value=expected) as list_mock,
         ):
             response = self.client.get(
                 "/scans",
@@ -2935,7 +2954,7 @@ class AdminEndpointSecurityTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"items": []})
+        self.assertEqual(response.json(), expected)
         list_mock.assert_called_once()
 
     def test_scans_rejects_missing_or_wrong_admin_key(self):
@@ -2950,11 +2969,19 @@ class AdminEndpointSecurityTests(unittest.TestCase):
         self.assertEqual(wrong.status_code, 403)
 
     def test_summary_requires_admin_key(self):
+        expected = {
+            "total": 0, "safe": 0, "warning": 0, "danger": 0, "unknown": 0,
+            "vt_malicious_total": 0, "vt_suspicious_total": 0, "recent_items": [],
+            "metadata": {
+                **make_history_metadata(200), "aggregated_count": 0,
+                "vt_totals_scope": "parent_history_records", "recent_items_limit": 10,
+            },
+        }
         with (
             patch.object(main, "ADMIN_API_KEY", self.admin_key),
             patch(
                 "app.main.get_scan_summary",
-                return_value={"total": 0},
+                return_value=expected,
             ) as summary_mock,
         ):
             allowed = self.client.get(
@@ -2968,7 +2995,7 @@ class AdminEndpointSecurityTests(unittest.TestCase):
             )
 
         self.assertEqual(allowed.status_code, 200)
-        self.assertEqual(allowed.json(), {"total": 0})
+        self.assertEqual(allowed.json(), expected)
         self.assertEqual(missing.status_code, 401)
         self.assertEqual(wrong.status_code, 403)
         summary_mock.assert_called_once()

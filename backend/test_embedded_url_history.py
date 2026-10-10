@@ -31,7 +31,7 @@ class RoundTripTable:
 
     def scan(self, **kwargs):
         self.scans.append(kwargs)
-        return {"Items": copy.deepcopy(self.items)}
+        return {"Items": copy.deepcopy(self.items), "ScannedCount": len(self.items)}
 
 
 class EmbeddedUrlHistoryTests(unittest.TestCase):
@@ -234,6 +234,7 @@ class EmbeddedUrlHistoryTests(unittest.TestCase):
             with self.subTest(count=count):
                 old = {
                     "scan_id": "old-id", "qr_type": "sms", "embedded_url_count": Decimal(count),
+                    "created_at": "2020-01-01T00:00:00Z",
                     "analyzed_embedded_url_count": Decimal(count), "embedded_url_max_score": Decimal("55"),
                     "risk_score": Decimal("55"), "status": "warning",
                     "analysis_flags": {"embedded_url_analysis_complete": True},
@@ -265,7 +266,7 @@ class EmbeddedUrlHistoryTests(unittest.TestCase):
         self.assertEqual(loaded["embedded_url_results"], [{"analysis_url": self.EXPLICIT}])
 
     def test_legacy_scans_api_serializes_unknown_detail_as_null(self):
-        self.table.items = [{"scan_id": "legacy", "embedded_url_count": Decimal("1")}]
+        self.table.items = [{"scan_id": "legacy", "created_at": "2020-01-01T00:00:00Z", "embedded_url_count": Decimal("1")}]
         with TestClient(main.app) as client:
             response = client.get("/scans", headers={"X-Admin-Key": "offline-admin"})
         self.assertEqual(response.status_code, 200)

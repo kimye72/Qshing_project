@@ -1,16 +1,22 @@
 import logging
 import os
 import uuid
+import json
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from math import isfinite
+from functools import wraps
 from typing import Any, Dict, List
 
 import boto3
 from boto3.dynamodb.conditions import Attr
 from botocore.exceptions import BotoCoreError, ClientError
 from dotenv import load_dotenv
-from app.services.analysis_budget import AnalysisBudgetExceeded, dynamodb_config
+from app.services.analysis_budget import (
+    AnalysisBudget, AnalysisBudgetExceeded, STORAGE_CALL_CAP_SECONDS,
+    budget_scope, current_budget, dynamodb_config,
+)
 
 load_dotenv()
 
@@ -23,6 +29,51 @@ DYNAMODB_ENABLED = os.getenv("DYNAMODB_ENABLED", "false").lower() == "true"
 SCAN_RESULT_TTL_DAYS = int(os.getenv("SCAN_RESULT_TTL_DAYS", "90"))
 DEFAULT_SCAN_SOURCE = os.getenv("DEFAULT_SCAN_SOURCE", "mobile_app")
 DATABASE_ERROR = "DATABASE_ERROR"
+HISTORY_READ_BUDGET_SECONDS = 8.0
+HISTORY_MAX_PAGES = 20
+HISTORY_MAX_EVALUATED_ITEMS = 4000
+HISTORY_PAGE_EVALUATION_LIMIT = 200
+_history_budget: ContextVar[AnalysisBudget | None] = ContextVar("history_read_budget", default=None)
+
+
+class ScanHistoryUnavailableError(RuntimeError):
+    """A disabled, failed or incomplete read must never look like an empty table."""
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__("Scan history unavailable")
+
+
+def _history_read_budget(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        budget = _history_budget.get()
+        if budget is None:
+            outer = current_budget()
+            budget = AnalysisBudget(
+                seconds=HISTORY_READ_BUDGET_SECONDS, clock=outer.clock if outer else None,
+            )
+            if outer:
+                budget.deadline = min(budget.deadline, outer.deadline)
+        token = _history_budget.set(budget)
+        try:
+            with budget_scope(budget):
+                if not DYNAMODB_ENABLED:
+                    raise ScanHistoryUnavailableError("SCAN_HISTORY_DISABLED")
+                budget.allowance(STORAGE_CALL_CAP_SECONDS, storage=True)
+                result = function(*args, **kwargs)
+                # Includes conversion/sort/aggregation, leaving response reserve.
+                budget.allowance(STORAGE_CALL_CAP_SECONDS, storage=True)
+                return result
+        except ScanHistoryUnavailableError:
+            raise
+        except AnalysisBudgetExceeded:
+            raise ScanHistoryUnavailableError("SCAN_HISTORY_INCOMPLETE") from None
+        except Exception as exc:
+            logger.warning("Scan history read failed: %s", type(exc).__name__)
+            raise ScanHistoryUnavailableError("SCAN_HISTORY_READ_FAILED") from None
+        finally:
+            _history_budget.reset(token)
+    return wrapped
 
 # Explicit projections of EmbeddedUrlResult / EmbeddedUrlFailure in schemas.py.
 # Never persist a whole analyzer result or raw external response as a child.
@@ -304,28 +355,115 @@ def save_scan_result(result: Dict[str, Any]) -> Dict[str, Any]:
         }
 
 
-def list_scan_results(limit: int = 20, status: str | None = None) -> List[Dict[str, Any]]:
-    """최근 스캔 결과를 대시보드가 쓰기 쉬운 형태로 반환합니다."""
-    if not DYNAMODB_ENABLED:
-        return []
+def _created_at_order(item: Dict[str, Any]) -> datetime:
+    """Never invent chronological positions for undated or invalid histories."""
+    try:
+        value = datetime.fromisoformat(item.get("created_at") or "")
+        return (value.replace(tzinfo=timezone.utc) if value.tzinfo is None
+                else value.astimezone(timezone.utc))
+    except (TypeError, ValueError, OverflowError):
+        raise ScanHistoryUnavailableError("SCAN_HISTORY_INCOMPLETE") from None
 
+
+def _history_identity(item: Dict[str, Any]) -> str:
+    if isinstance(item.get("scan_id"), str) and item["scan_id"]:
+        return "scan_id:" + item["scan_id"]
+    # Old malformed records without an ID have no better identity. Preserve
+    # distinct raw records and deduplicate exact copies deterministically.
+    return "legacy:" + json.dumps(_to_json_safe(item), sort_keys=True, separators=(",", ":"))
+
+
+@_history_read_budget
+def get_recent_scan_history(limit: int = 20, status: str | None = None) -> Dict[str, Any]:
+    """Finish a bounded full table traversal before claiming the latest N rows."""
     safe_limit = max(1, min(int(limit), 500))
-    table = _get_table()
+    status_filter = status if status in {"safe", "warning", "danger"} else None
+    items_by_id: Dict[str, Dict[str, Any]] = {}
+    seen_keys: set[str] = set()
+    next_key = None
+    pages = evaluated = 0
+    budget = _history_budget.get()
 
-    scan_kwargs: Dict[str, Any] = {"Limit": safe_limit}
-    if status in {"safe", "warning", "danger"}:
-        scan_kwargs["FilterExpression"] = Attr("status").eq(status)
+    while True:
+        if pages >= HISTORY_MAX_PAGES or evaluated >= HISTORY_MAX_EVALUATED_ITEMS:
+            raise ScanHistoryUnavailableError("SCAN_HISTORY_INCOMPLETE")
+        budget.allowance(STORAGE_CALL_CAP_SECONDS, storage=True)
+        page_limit = min(HISTORY_PAGE_EVALUATION_LIMIT, HISTORY_MAX_EVALUATED_ITEMS - evaluated)
+        scan_kwargs: Dict[str, Any] = {"Limit": page_limit, "ConsistentRead": True}
+        if status_filter:
+            scan_kwargs["FilterExpression"] = Attr("status").eq(status_filter)
+        if next_key:
+            scan_kwargs["ExclusiveStartKey"] = next_key
+        # Recreate the SDK resource so each page's socket timeouts are capped
+        # by the SAME deadline's remaining allowance. Resource/credential
+        # construction itself is not cancelled by a socket timeout.
+        table = _get_table()
+        budget.allowance(STORAGE_CALL_CAP_SECONDS, storage=True)
+        response = table.scan(**scan_kwargs)
+        budget.allowance(STORAGE_CALL_CAP_SECONDS, storage=True)
+        page_items = response["Items"]
+        scanned = response["ScannedCount"]
+        if (not isinstance(page_items, list) or isinstance(scanned, bool)
+                or not isinstance(scanned, (int, Decimal)) or int(scanned) != scanned
+                or not len(page_items) <= scanned <= page_limit):
+            raise ValueError("Invalid scan page")
+        pages += 1
+        evaluated += int(scanned)
+        for item in page_items:
+            if not isinstance(item, dict):
+                raise ValueError("Invalid history item")
+            if status_filter and item.get("status") != status_filter:
+                continue
+            identity = _history_identity(item)
+            if identity in items_by_id and items_by_id[identity] != item:
+                # Conflicting copies during a concurrent write cannot be
+                # resolved into a trustworthy latest view; discard the read.
+                raise ScanHistoryUnavailableError("SCAN_HISTORY_INCOMPLETE")
+            items_by_id[identity] = item
+        next_key = response.get("LastEvaluatedKey")
+        if next_key is not None and not isinstance(next_key, dict):
+            raise ValueError("Invalid scan cursor")
+        if not next_key:
+            break
+        key_token = repr(sorted(next_key.items()))
+        if key_token in seen_keys:
+            raise ScanHistoryUnavailableError("SCAN_HISTORY_INCOMPLETE")
+        seen_keys.add(key_token)
 
-    response = table.scan(**scan_kwargs)
-    items = response.get("Items", [])
+    ordered = sorted(items_by_id.values(), key=lambda item: (
+        _created_at_order(item), _history_identity(item),
+    ), reverse=True)
+    dashboard_items = [_make_dashboard_item(item) for item in ordered[:safe_limit]]
+    return {
+        "items": dashboard_items,
+        "metadata": {
+            "scope": "latest_saved_history_for_status" if status_filter else "latest_saved_history",
+            "count_unit": "stored_history_records", "requested_limit": safe_limit,
+            "returned_count": len(dashboard_items), "status_filter": status_filter,
+            "query_complete": True, "pages_read": pages, "evaluated_items": evaluated,
+            "matching_records_count": len(items_by_id),
+            "ordering": "created_at_desc_scan_id_desc",
+            "read_consistency": "strong_per_item_not_snapshot",
+            "bounds": {
+                "time_budget_seconds": HISTORY_READ_BUDGET_SECONDS,
+                "max_pages": HISTORY_MAX_PAGES,
+                "max_evaluated_items": HISTORY_MAX_EVALUATED_ITEMS,
+                "page_evaluation_limit": HISTORY_PAGE_EVALUATION_LIMIT,
+            },
+        },
+    }
 
-    dashboard_items = [_make_dashboard_item(item) for item in items]
-    return sorted(dashboard_items, key=lambda item: item.get("created_at") or "", reverse=True)
+
+def list_scan_results(limit: int = 20, status: str | None = None) -> List[Dict[str, Any]]:
+    """Compatibility wrapper; never return a partial read or disabled-DB empty list."""
+    return get_recent_scan_history(limit=limit, status=status)["items"]
 
 
+@_history_read_budget
 def get_scan_summary(limit: int = 200) -> Dict[str, Any]:
-    """대시보드 상단 카드와 그래프용 간단 통계를 반환합니다."""
-    items = list_scan_results(limit=limit)
+    """Aggregate the latest N stored parent histories, not scans or the whole table."""
+    history = get_recent_scan_history(limit=limit)
+    items = history["items"]
     summary = {
         "total": len(items),
         "safe": 0,
@@ -335,6 +473,10 @@ def get_scan_summary(limit: int = 200) -> Dict[str, Any]:
         "vt_malicious_total": 0,
         "vt_suspicious_total": 0,
         "recent_items": items[:10],
+        "metadata": {
+            **history["metadata"], "aggregated_count": len(items),
+            "vt_totals_scope": "parent_history_records", "recent_items_limit": 10,
+        },
     }
 
     for item in items:

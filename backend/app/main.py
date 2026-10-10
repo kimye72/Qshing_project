@@ -20,11 +20,15 @@ from app.schemas import (
     QRAnalyzeResponse,
     ScanRequest,
     ScanResponse,
+    ScanListResponse,
+    ScanSummaryResponse,
+    ScanHistoryReadErrorResponse,
 )
 from app.services.database import (
     DATABASE_ERROR,
     get_scan_summary,
-    list_scan_results,
+    get_recent_scan_history,
+    ScanHistoryUnavailableError,
     save_scan_result,
 )
 from app.services.qr_analyzer import (
@@ -67,6 +71,17 @@ async def url_analysis_unavailable_handler(request, exc):
     return JSONResponse(
         status_code=503,
         content={"detail": "URL 분석을 완료하지 못했습니다. 잠시 후 다시 시도해 주세요."},
+    )
+
+
+@app.exception_handler(ScanHistoryUnavailableError)
+async def scan_history_unavailable_handler(request, exc):
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": "스캔 이력을 조회하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+            "error_code": exc.code,
+        },
     )
 
 
@@ -514,12 +529,16 @@ def analyze_qr(data: QRAnalyzeRequest):
 
 @app.get(
     "/scans",
+    response_model=ScanListResponse,
+    responses={503: {"model": ScanHistoryReadErrorResponse, "description": "DB 비활성·실패·조회 범위 미완료"}},
     dependencies=[Depends(require_admin_api_key)],
     summary="스캔 결과 목록 조회",
     description=(
         "DynamoDB에 저장된 최근 QR 분석 이력을 조회합니다. "
         "직접 URL은 최초 분석과 위험도 변화 이력 중심이며, "
         "위험 상태를 기준으로 결과를 필터링할 수 있습니다."
+        "조회 상한 안에서 전체 페이지를 확인한 경우에만 최신 N건을 반환하며, "
+        "완료하지 못하면 부분 목록 대신 503을 반환합니다."
     ),
     tags=["Dashboard"],
 )
@@ -528,28 +547,26 @@ def get_scans(
         default=20,
         ge=1,
         le=100,
-        description="조회할 최대 결과 개수",
+        description="해당 상태의 최신 저장 이력을 반환할 최대 개수. Scan 페이지 평가 개수가 아님",
     ),
     status: Literal["safe", "warning", "danger"] | None = Query(
         default=None,
         description="위험 상태 필터",
     ),
 ):
-    return {
-        "items": list_scan_results(
-            limit=limit,
-            status=status,
-        )
-    }
+    return get_recent_scan_history(limit=limit, status=status)
 
 
 @app.get(
     "/scans/summary",
+    response_model=ScanSummaryResponse,
+    responses={503: {"model": ScanHistoryReadErrorResponse, "description": "DB 비활성·실패·조회 범위 미완료"}},
     dependencies=[Depends(require_admin_api_key)],
     summary="스캔 통계 조회",
     description=(
-        "저장된 QR 분석 이력을 기반으로 "
-        "위험 상태별 통계 정보를 반환합니다."
+        "최근 N개 저장 이력의 상태 개수와 부모 VT 합계를 반환합니다. "
+        "total은 집계 대상 저장 이력 수이며 전체 요청 횟수나 테이블 전체 건수가 아닙니다. "
+        "조회 미완료 시 부분 통계 대신 503을 반환합니다."
     ),
     tags=["Dashboard"],
 )
@@ -558,7 +575,7 @@ def get_scans_summary(
         default=200,
         ge=1,
         le=500,
-        description="통계 계산에 사용할 최대 결과 개수",
+        description="통계를 집계할 최근 저장 이력의 최대 개수. 전체 요청 횟수가 아님",
     )
 ):
     return get_scan_summary(limit=limit)

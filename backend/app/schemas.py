@@ -6,6 +6,58 @@ from pydantic import BaseModel, Field, HttpUrl, TypeAdapter, field_validator
 _HTTP_URL_ADAPTER = TypeAdapter(HttpUrl)
 
 
+class HistoryReadBounds(BaseModel):
+    time_budget_seconds: float
+    max_pages: int
+    max_evaluated_items: int
+    page_evaluation_limit: int
+
+
+class ScanHistoryMetadata(BaseModel):
+    scope: Literal["latest_saved_history", "latest_saved_history_for_status"]
+    count_unit: Literal["stored_history_records"]
+    requested_limit: int
+    returned_count: int
+    status_filter: Optional[Literal["safe", "warning", "danger"]]
+    query_complete: Literal[True]
+    pages_read: int
+    evaluated_items: int
+    matching_records_count: int
+    ordering: Literal["created_at_desc_scan_id_desc"]
+    read_consistency: Literal["strong_per_item_not_snapshot"]
+    bounds: HistoryReadBounds
+
+
+class ScanListResponse(BaseModel):
+    items: List[Dict[str, Any]]
+    metadata: ScanHistoryMetadata
+
+
+class ScanSummaryMetadata(ScanHistoryMetadata):
+    aggregated_count: int
+    vt_totals_scope: Literal["parent_history_records"]
+    recent_items_limit: int
+
+
+class ScanSummaryResponse(BaseModel):
+    total: int = Field(..., description="최근 N개 저장 이력 중 실제 집계 건수. 요청 횟수·테이블 전체 건수가 아님")
+    safe: int
+    warning: int
+    danger: int
+    unknown: int
+    vt_malicious_total: int = Field(..., description="집계 대상 부모 이력의 VT 악성 탐지 수 합계")
+    vt_suspicious_total: int = Field(..., description="집계 대상 부모 이력의 VT 의심 탐지 수 합계")
+    recent_items: List[Dict[str, Any]] = Field(..., description="동일 집계 집합에서 최신 최대 10개 미리보기")
+    metadata: ScanSummaryMetadata
+
+
+class ScanHistoryReadErrorResponse(BaseModel):
+    detail: str
+    error_code: Optional[Literal["SCAN_HISTORY_DISABLED", "SCAN_HISTORY_READ_FAILED", "SCAN_HISTORY_INCOMPLETE"]] = Field(
+        default=None, description="조회 실패의 공개 코드. 관리자 인증 구성 오류의 기존 503에는 없음",
+    )
+
+
 class EmbeddedUrlTarget(BaseModel):
     original_url: str = Field(..., description="분석 대상 원본 링크 또는 후보")
     original_candidates: List[str] = Field(default_factory=list, description="동일 분석 주소로 합쳐진 원본 스킴 없는 후보")
