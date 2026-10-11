@@ -22,13 +22,15 @@ class AnalysisResultView extends StatelessWidget {
             ),
             const SizedBox(height: 12),
           ],
-          _riskSummary(result.status, result.riskScore),
+          _riskOverview(),
           const SizedBox(height: 14),
           _card([
+            _iconText(Icons.qr_code_rounded, '스캔 정보', color: AppColors.accent),
+            const SizedBox(height: 12),
             _iconText(Icons.qr_code_rounded, qrTypeLabel(result.qrType)),
             if (result.preview.isNotEmpty) ...[
               const SizedBox(height: 6),
-              Text(result.preview, style: _bodyStyle),
+              SelectableText(result.preview, style: _bodyStyle),
             ],
             if (result.qrType == 'url' && result.url != null) ...[
               const SizedBox(height: 8),
@@ -70,7 +72,10 @@ class AnalysisResultView extends StatelessWidget {
                 style: _bodyStyle,
               ),
           ],
-          _reasonList(result.reasons),
+          if (result.reasons.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            _card([_reasonList(result.reasons)]),
+          ],
           if (result.embeddedUrls.isNotEmpty) ...[
             const SizedBox(height: 16),
             _sectionTitle('포함 URL 분석 결과'),
@@ -101,7 +106,7 @@ class AnalysisResultView extends StatelessWidget {
   }
 
   static const _bodyStyle = TextStyle(
-    fontSize: 13,
+    fontSize: 14,
     color: AppColors.textSec,
     height: 1.6,
   );
@@ -202,7 +207,100 @@ class AnalysisResultView extends StatelessWidget {
     return _notice(Icons.info_outline_rounded, '$title\n${lines.join('\n')}');
   }
 
-  Widget _riskSummary(String? status, num? score) {
+  Color _statusColor(String? status) => switch (status) {
+    'safe' => AppColors.safe,
+    'warning' => AppColors.warning,
+    'danger' => AppColors.danger,
+    _ => AppColors.textHint,
+  };
+
+  Widget _riskOverview() {
+    final color = _statusColor(result.status);
+    return Container(
+      key: const Key('risk-overview'),
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(24),
+        gradient: LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [color.withValues(alpha: 0.14), AppColors.bg],
+        ),
+      ),
+      child: Column(
+        children: [
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final diameter = math.min(
+                constraints.maxWidth,
+                MediaQuery.textScalerOf(
+                  context,
+                ).scale(156).clamp(156, 240).toDouble(),
+              );
+              return Semantics(
+                label: '위험 점수 ${result.riskScore}. 악성 확률이 아닙니다.',
+                excludeSemantics: true,
+                child: SizedBox.square(
+                  key: const Key('risk-score-ring'),
+                  dimension: diameter,
+                  child: Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      Positioned.fill(
+                        child: CircularProgressIndicator(
+                          value:
+                              result.riskScore.toDouble().clamp(0, 100) / 100,
+                          color: color,
+                          backgroundColor: color.withValues(alpha: 0.16),
+                          strokeWidth: 10,
+                          strokeCap: StrokeCap.round,
+                        ),
+                      ),
+                      Padding(
+                        padding: const EdgeInsets.all(20),
+                        child: FittedBox(
+                          fit: BoxFit.scaleDown,
+                          child: Text(
+                            '${result.riskScore}',
+                            key: const Key('risk-score-value'),
+                            style: TextStyle(
+                              fontSize: 44,
+                              fontWeight: FontWeight.w800,
+                              color: color,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            },
+          ),
+          const SizedBox(height: 12),
+          Text(
+            '위험 점수 ${result.riskScore}',
+            textAlign: TextAlign.center,
+            style: _bodyStyle.copyWith(
+              color: color,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const SizedBox(height: 12),
+          _riskSummary(result.status, result.riskScore, showScore: false),
+          const SizedBox(height: 12),
+          const Text(
+            '점수는 악성 확률이나 신뢰도 퍼센트가 아닙니다.',
+            textAlign: TextAlign.center,
+            style: _bodyStyle,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _riskSummary(String? status, num? score, {bool showScore = true}) {
     final color = switch (status) {
       'safe' => AppColors.safe,
       'warning' => AppColors.warning,
@@ -236,20 +334,21 @@ class AnalysisResultView extends StatelessWidget {
           ),
           child: _iconText(icon, riskStatusLabel(status), color: color),
         ),
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
-          decoration: BoxDecoration(
-            color: AppColors.surfaceSub,
-            borderRadius: BorderRadius.circular(20),
-          ),
-          child: Text(
-            score == null ? '위험 점수 확인 불가' : '위험 점수 $score',
-            style: _bodyStyle.copyWith(
-              color: color,
-              fontWeight: FontWeight.w700,
+        if (showScore)
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+            decoration: BoxDecoration(
+              color: AppColors.surfaceSub,
+              borderRadius: BorderRadius.circular(20),
+            ),
+            child: Text(
+              score == null ? '위험 점수 확인 불가' : '위험 점수 $score',
+              style: _bodyStyle.copyWith(
+                color: color,
+                fontWeight: FontWeight.w700,
+              ),
             ),
           ),
-        ),
       ],
     );
   }
@@ -287,10 +386,10 @@ class AnalysisResultView extends StatelessWidget {
   Widget _card(List<Widget> children, {Key? key}) => Container(
     key: key,
     width: double.infinity,
-    padding: const EdgeInsets.all(14),
+    padding: const EdgeInsets.all(18),
     decoration: BoxDecoration(
-      color: AppColors.surfaceSub,
-      borderRadius: BorderRadius.circular(12),
+      color: AppColors.surface,
+      borderRadius: BorderRadius.circular(18),
       border: Border.all(color: AppColors.border),
     ),
     child: Column(

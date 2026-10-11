@@ -33,6 +33,93 @@ Finder textContaining(String text) =>
     find.textContaining(text, findRichText: true);
 
 void main() {
+  testWidgets('risk ring immediately shows the actual score and decision', (
+    tester,
+  ) async {
+    for (final entry in {
+      0: 'safe',
+      17: 'safe',
+      55: 'warning',
+      85: 'danger',
+    }.entries) {
+      await showResult(
+        tester,
+        analysisResponse()..addAll({
+          'risk_score': entry.key,
+          'final_score': entry.key,
+          'status': entry.value,
+        }),
+      );
+      final number = tester.widget<Text>(
+        find.byKey(const Key('risk-score-value')),
+      );
+      expect(number.data, '${entry.key}');
+      final ring = tester.widget<CircularProgressIndicator>(
+        find.descendant(
+          of: find.byKey(const Key('risk-score-ring')),
+          matching: find.byType(CircularProgressIndicator),
+        ),
+      );
+      expect(ring.value, entry.key / 100);
+      expect(find.text(riskStatusLabel(entry.value)), findsOneWidget);
+      expect(find.text('위험 점수 ${entry.key}'), findsOneWidget);
+      expect(textContaining('점수는 악성 확률이나 신뢰도 퍼센트가 아닙니다.'), findsOneWidget);
+      expect(tester.binding.hasScheduledFrame, isFalse);
+    }
+  });
+
+  testWidgets(
+    'partial warning precedes low-risk ring; absent child score stays unknown',
+    (tester) async {
+      tester.view.physicalSize = const Size(280, 568);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      final child = embeddedResponse()
+        ..remove('risk_score')
+        ..remove('final_score')
+        ..remove('status');
+      final longPreview = List.filled(
+        20,
+        '긴 QR 본문과 URL의 대소문자 Path?Token=AbCd',
+      ).join('\n');
+      await showResult(
+        tester,
+        withEmbeddedUrls([child])..addAll({
+          'embedded_url_analysis_complete': false,
+          'analysis_flags': {'embedded_url_skipped_count': 1},
+          'raw_content_preview': longPreview,
+        }),
+        textScale: 2,
+      );
+      final warning = tester.getRect(find.text('일부 링크의 분석을 완료하지 못했습니다.'));
+      final overview = tester.getRect(find.byKey(const Key('risk-overview')));
+      expect(warning.bottom, lessThan(overview.top));
+      final card = find.byKey(const Key('embedded-result-0'));
+      expect(
+        find.descendant(of: card, matching: find.text('위험 점수 확인 불가')),
+        findsOneWidget,
+      );
+      expect(
+        find.descendant(of: card, matching: find.text('판정 확인 불가')),
+        findsOneWidget,
+      );
+      expect(
+        find.descendant(of: card, matching: find.text('위험 점수 0')),
+        findsNothing,
+      );
+      final preview = tester.widget<SelectableText>(
+        find.byWidgetPredicate(
+          (widget) => widget is SelectableText && widget.data == longPreview,
+        ),
+      );
+      expect(preview.maxLines, isNull);
+      expect(preview.data, longPreview);
+      expect(find.text('다시 스캔하기').hitTestable(), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
   testWidgets('historical flag survives unknown source and absent counts', (
     tester,
   ) async {

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
@@ -63,7 +64,6 @@ class QrPhishingApp extends StatelessWidget {
         useMaterial3: true,
         colorSchemeSeed: AppColors.accent,
         scaffoldBackgroundColor: AppColors.bg,
-        fontFamily: 'Pretendard',
         appBarTheme: const AppBarTheme(
           backgroundColor: AppColors.surface,
           foregroundColor: AppColors.textPrim,
@@ -116,6 +116,7 @@ class _ScanPageState extends State<ScanPage>
   bool _cameraReady = false;
   bool _reuseStartListeners = false;
   bool _disposed = false;
+  bool _reduceMotion = false;
   int _requestGeneration = 0;
 
   AnalysisResult? _result;
@@ -142,7 +143,6 @@ class _ScanPageState extends State<ScanPage>
     _pulseAnim = Tween<double>(begin: 0.6, end: 1.0).animate(
       CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
     );
-    if (_foreground) _pulseController.repeat(reverse: true);
     WidgetsBinding.instance.addObserver(this);
     // Exactly one application listener for the lifetime of the page. The
     // preview only displays the controller; it does not subscribe onDetect.
@@ -159,6 +159,24 @@ class _ScanPageState extends State<ScanPage>
 
   bool get _canScan =>
       !_disposed && mounted && _foreground && _phase == _ScanPhase.scanning;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _reduceMotion = MediaQuery.disableAnimationsOf(context);
+    _syncPulse();
+  }
+
+  void _syncPulse() {
+    if (_canScan && !_reduceMotion) {
+      if (!_pulseController.isAnimating) {
+        _pulseController.repeat(reverse: true);
+      }
+    } else {
+      _pulseController.stop();
+      if (_reduceMotion) _pulseController.value = 1;
+    }
+  }
 
   void _scheduleCameraSync() {
     // Attach the initial preview before start; rebuild rescan state first too.
@@ -276,11 +294,7 @@ class _ScanPageState extends State<ScanPage>
       _foreground = state == AppLifecycleState.resumed;
       if (!_foreground) _cameraReady = false;
     });
-    if (!_foreground) {
-      _pulseController.stop();
-    } else if (_phase == _ScanPhase.scanning) {
-      _pulseController.repeat(reverse: true);
-    }
+    _syncPulse();
     unawaited(_syncCamera());
   }
 
@@ -388,7 +402,7 @@ class _ScanPageState extends State<ScanPage>
       _phase = _ScanPhase.scanning;
       _cameraReady = false;
     });
-    if (_foreground) _pulseController.repeat(reverse: true);
+    _syncPulse();
     _scheduleCameraSync();
   }
 
@@ -419,42 +433,45 @@ class _ScanPageState extends State<ScanPage>
     super.dispose();
   }
 
-  // ── 빌드 ─────────────────────────────────────────────
+  static const _ink = Color(0xFF0F172A);
+
   @override
   Widget build(BuildContext context) {
+    final scanning = _phase == _ScanPhase.scanning;
+    final darkHeader = scanning || _phase == _ScanPhase.analyzing;
     return Scaffold(
-      backgroundColor: Colors.black,
+      backgroundColor: AppColors.bg,
       appBar: AppBar(
-        toolbarHeight: MediaQuery.textScalerOf(context).scale(16) * 2 + 24,
-        backgroundColor: Colors.black,
-        foregroundColor: Colors.white,
+        toolbarHeight: MediaQuery.textScalerOf(context).scale(20) + 32,
+        backgroundColor: darkHeader ? _ink : AppColors.surface,
+        foregroundColor: darkHeader ? Colors.white : AppColors.textPrim,
+        centerTitle: false,
         title: Row(
-          mainAxisSize: MainAxisSize.min,
           children: [
             Container(
-              width: 28,
-              height: 28,
+              width: 34,
+              height: 34,
               decoration: BoxDecoration(
-                color: AppColors.dangerBg,
-                border: Border.all(color: AppColors.danger.withOpacity(0.4)),
-                borderRadius: BorderRadius.circular(6),
+                color: darkHeader
+                    ? Colors.white.withValues(alpha: 0.14)
+                    : AppColors.accentBg,
+                borderRadius: BorderRadius.circular(10),
               ),
-              child: const Icon(
-                Icons.qr_code_scanner_rounded,
-                size: 16,
-                color: AppColors.danger,
+              child: Icon(
+                Icons.shield_outlined,
+                size: 20,
+                color: darkHeader ? Colors.white : AppColors.accent,
               ),
             ),
-            const SizedBox(width: 8),
-            const Flexible(
+            const SizedBox(width: 10),
+            Flexible(
               child: Text(
                 'Qshing',
-                maxLines: 2,
                 style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 16,
-                  fontWeight: FontWeight.w600,
-                  letterSpacing: -0.3,
+                  color: darkHeader ? Colors.white : AppColors.textPrim,
+                  fontSize: 20,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: -0.4,
                 ),
               ),
             ),
@@ -463,8 +480,11 @@ class _ScanPageState extends State<ScanPage>
       ),
       bottomNavigationBar:
           _phase == _ScanPhase.result || _phase == _ScanPhase.error
-          ? ColoredBox(
-              color: AppColors.surface,
+          ? Container(
+              decoration: const BoxDecoration(
+                color: AppColors.surface,
+                border: Border(top: BorderSide(color: AppColors.border)),
+              ),
               child: SafeArea(
                 top: false,
                 child: Padding(
@@ -474,155 +494,41 @@ class _ScanPageState extends State<ScanPage>
               ),
             )
           : null,
-      // Keep the preview attached once. Offstage takes no visible space; the
-      // native camera is explicitly stopped before HTTP analysis. This also
-      // avoids the plugin's debug startup/hot-restart stop on every rescan.
+      // Keep the same preview/controller attached through every phase. Its
+      // native start/stop and lifecycle are still owned by the existing queue.
       body: Stack(
         fit: StackFit.expand,
         children: [
           Offstage(
-            offstage: _phase != _ScanPhase.scanning,
+            offstage: !scanning,
             child: TickerMode(
-              enabled: _phase == _ScanPhase.scanning && _foreground,
-              child: Column(
-                children: [
-                  // ── 카메라 스캔 영역 ──
-                  Expanded(
-                    flex: 5,
-                    child: Stack(
-                      children: [
-                        MobileScanner(
-                          key: const Key('scan-camera'),
-                          controller: _scannerController,
-                          useAppLifecycleState: false,
-                          errorBuilder: (_, _) => const SizedBox.shrink(),
+              enabled: scanning && _foreground && !_reduceMotion,
+              child: SafeArea(
+                top: false,
+                bottom: false,
+                child: LayoutBuilder(
+                  builder: (context, constraints) => Column(
+                    children: [
+                      Expanded(child: _buildCameraView()),
+                      // Natural panel height on large screens; scroll within a
+                      // cap on small screens, leaving real space for the frame.
+                      ConstrainedBox(
+                        constraints: BoxConstraints(
+                          maxHeight: constraints.maxHeight * 0.52,
                         ),
-
-                        // 스캔 프레임
-                        if (_cameraReady)
-                          Center(
-                            child: AnimatedBuilder(
-                              animation: _pulseAnim,
-                              builder: (_, __) => Container(
-                                width: 220,
-                                height: 220,
-                                decoration: BoxDecoration(
-                                  border: Border.all(
-                                    color: Colors.white.withOpacity(
-                                      _pulseAnim.value,
-                                    ),
-                                    width: 2.5,
-                                  ),
-                                  borderRadius: BorderRadius.circular(16),
-                                ),
-                                child: Stack(
-                                  children: [
-                                    _corner(0, 0, true, true),
-                                    _corner(0, 0, true, false),
-                                    _corner(0, 0, false, true),
-                                    _corner(0, 0, false, false),
-                                  ],
-                                ),
-                              ),
-                            ),
-                          ),
-
-                        // 스캔 가이드 텍스트
-                        if (_cameraReady)
-                          Positioned(
-                            bottom: 24,
-                            left: 0,
-                            right: 0,
-                            child: Center(
-                              child: Container(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 18,
-                                  vertical: 10,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: Colors.black.withOpacity(0.55),
-                                  borderRadius: BorderRadius.circular(20),
-                                ),
-                                child: const Text(
-                                  'QR 코드를 네모 안에 맞춰주세요',
-                                  textAlign: TextAlign.center,
-                                  style: TextStyle(
-                                    color: Colors.white,
-                                    fontSize: 13,
-                                    fontWeight: FontWeight.w500,
-                                  ),
-                                ),
-                              ),
-                            ),
-                          ),
-
-                        // 로딩 오버레이
-                        if (!_cameraReady)
-                          Container(
-                            color: Colors.black.withOpacity(0.7),
-                            child: Center(
-                              child: SingleChildScrollView(
-                                child: Column(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    Container(
-                                      width: 72,
-                                      height: 72,
-                                      decoration: BoxDecoration(
-                                        color: Colors.white.withOpacity(0.1),
-                                        shape: BoxShape.circle,
-                                        border: Border.all(
-                                          color: Colors.white.withOpacity(0.2),
-                                        ),
-                                      ),
-                                      child: const Padding(
-                                        padding: EdgeInsets.all(18),
-                                        child: CircularProgressIndicator(
-                                          color: Colors.white,
-                                          strokeWidth: 2.5,
-                                        ),
-                                      ),
-                                    ),
-                                    const SizedBox(height: 20),
-                                    const Text(
-                                      '카메라 준비 중',
-                                      style: TextStyle(
-                                        color: Colors.white,
-                                        fontSize: 16,
-                                        fontWeight: FontWeight.w600,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ),
-                          ),
-                      ],
-                    ),
-                  ),
-
-                  // ── 결과 패널 ──
-                  Expanded(
-                    flex: 4,
-                    child: Container(
-                      width: double.infinity,
-                      decoration: const BoxDecoration(
-                        color: AppColors.surface,
-                        borderRadius: BorderRadius.vertical(
-                          top: Radius.circular(24),
-                        ),
+                        child: _buildGuideView(),
                       ),
-                      child: _buildGuideView(),
-                    ),
+                    ],
                   ),
-                ],
+                ),
               ),
             ),
           ),
-          if (_phase == _ScanPhase.analyzing) _buildProgressView(),
+          if (_phase == _ScanPhase.analyzing)
+            ColoredBox(color: _ink, child: _buildProgressView()),
           if (_phase == _ScanPhase.result || _phase == _ScanPhase.error)
-            ColoredBox(
-              color: AppColors.surface,
+            SafeArea(
+              top: false,
               child: _phase == _ScanPhase.error
                   ? _buildErrorView()
                   : _buildResultView(),
@@ -632,165 +538,293 @@ class _ScanPageState extends State<ScanPage>
     );
   }
 
-  // 모서리 장식
-  Widget _corner(double top, double left, bool isTop, bool isLeft) {
-    return Positioned(
-      top: isTop ? 0 : null,
-      bottom: isTop ? null : 0,
-      left: isLeft ? 0 : null,
-      right: isLeft ? null : 0,
-      child: Container(
-        width: 24,
-        height: 24,
-        decoration: BoxDecoration(
-          border: Border(
-            top: isTop
-                ? const BorderSide(color: AppColors.accent, width: 3)
-                : BorderSide.none,
-            bottom: !isTop
-                ? const BorderSide(color: AppColors.accent, width: 3)
-                : BorderSide.none,
-            left: isLeft
-                ? const BorderSide(color: AppColors.accent, width: 3)
-                : BorderSide.none,
-            right: !isLeft
-                ? const BorderSide(color: AppColors.accent, width: 3)
-                : BorderSide.none,
+  Widget _buildCameraView() => LayoutBuilder(
+    builder: (context, constraints) {
+      final side = math.max(
+        0.0,
+        math.min(
+          300.0,
+          math.min(constraints.maxWidth - 48, constraints.maxHeight - 40),
+        ),
+      );
+      final hole = Rect.fromCenter(
+        center: Offset(constraints.maxWidth / 2, constraints.maxHeight / 2),
+        width: side,
+        height: side,
+      );
+      return Stack(
+        key: const Key('camera-region'),
+        fit: StackFit.expand,
+        children: [
+          MobileScanner(
+            key: const Key('scan-camera'),
+            controller: _scannerController,
+            useAppLifecycleState: false,
+            errorBuilder: (context, error) => const SizedBox.shrink(),
           ),
+          if (_cameraReady && side > 0) ...[
+            Positioned.fill(
+              child: IgnorePointer(
+                child: CustomPaint(
+                  key: const Key('scan-mask'),
+                  painter: _ScanMaskPainter(hole),
+                ),
+              ),
+            ),
+            Positioned.fromRect(
+              rect: hole,
+              child: IgnorePointer(
+                child: AnimatedBuilder(
+                  animation: _pulseAnim,
+                  builder: (context, child) => Container(
+                    key: const Key('scan-frame'),
+                    decoration: BoxDecoration(
+                      border: Border.all(
+                        color: Colors.white.withValues(
+                          alpha: 0.45 + 0.45 * _pulseAnim.value,
+                        ),
+                        width: 2.5,
+                      ),
+                      borderRadius: BorderRadius.circular(28),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+          if (!_cameraReady)
+            ColoredBox(
+              color: _ink,
+              child: Center(
+                child: SingleChildScrollView(
+                  padding: const EdgeInsets.all(20),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (_reduceMotion)
+                        const Icon(
+                          Icons.camera_alt_outlined,
+                          color: Colors.white,
+                          size: 40,
+                        )
+                      else
+                        const CircularProgressIndicator(color: Colors.white),
+                      const SizedBox(height: 16),
+                      const Text(
+                        '카메라 준비 중',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(color: Colors.white, fontSize: 16),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+        ],
+      );
+    },
+  );
+
+  Widget _buildGuideView() => Container(
+    key: const Key('scan-guide-panel'),
+    width: double.infinity,
+    decoration: const BoxDecoration(
+      color: AppColors.surface,
+      borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+    ),
+    child: SafeArea(
+      top: false,
+      child: SingleChildScrollView(
+        key: const Key('scan-guide-scroll'),
+        primary: false,
+        padding: const EdgeInsets.fromLTRB(24, 24, 24, 20),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Container(
+                  width: 44,
+                  height: 44,
+                  decoration: BoxDecoration(
+                    color: AppColors.accentBg,
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                  child: const Icon(
+                    Icons.verified_user_rounded,
+                    color: AppColors.accent,
+                    size: 24,
+                  ),
+                ),
+                const SizedBox(width: 14),
+                const Expanded(
+                  child: Text(
+                    'QR 코드를 스캔하세요',
+                    style: TextStyle(
+                      fontSize: 20,
+                      fontWeight: FontWeight.w800,
+                      color: AppColors.textPrim,
+                      letterSpacing: -0.4,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              'QR 코드를 네모 안에 맞춰주세요',
+              style: TextStyle(fontSize: 14, color: AppColors.textSec),
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              'QR을 자동으로 열지 않고, 먼저 위험도를 분석합니다.',
+              style: TextStyle(
+                fontSize: 14,
+                color: AppColors.textSec,
+                height: 1.5,
+              ),
+            ),
+            const SizedBox(height: 16),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                _infoChip(Icons.link_rounded, 'URL'),
+                _infoChip(Icons.phone_outlined, '전화번호'),
+                _infoChip(Icons.sms_outlined, '문자'),
+                _infoChip(Icons.mail_outline_rounded, '이메일'),
+                _infoChip(Icons.wifi_rounded, 'Wi-Fi'),
+              ],
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
+
+  Widget _infoChip(IconData icon, String label) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+    decoration: BoxDecoration(
+      color: AppColors.surfaceSub,
+      borderRadius: BorderRadius.circular(20),
+    ),
+    child: Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(icon, size: 14, color: AppColors.accent),
+        const SizedBox(width: 6),
+        Text(
+          label,
+          style: const TextStyle(
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+            color: AppColors.textSec,
+          ),
+        ),
+      ],
+    ),
+  );
+
+  Widget _buildErrorView() {
+    final message = _errorMessage ?? '';
+    final icon = message.contains('카메라 권한')
+        ? Icons.no_photography_outlined
+        : message.contains('카메라')
+        ? Icons.camera_alt_outlined
+        : message.contains('시간')
+        ? Icons.timer_off_outlined
+        : Icons.cloud_off_rounded;
+    return SingleChildScrollView(
+      key: const Key('analysis-error-scroll'),
+      padding: const EdgeInsets.all(24),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(24),
+        decoration: BoxDecoration(
+          color: AppColors.surface,
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(color: AppColors.border),
+        ),
+        child: Column(
+          children: [
+            Container(
+              width: 88,
+              height: 88,
+              decoration: const BoxDecoration(
+                color: AppColors.dangerBg,
+                shape: BoxShape.circle,
+              ),
+              child: Icon(icon, size: 40, color: AppColors.danger),
+            ),
+            const SizedBox(height: 20),
+            const Text(
+              '오류 발생',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                fontSize: 20,
+                fontWeight: FontWeight.w800,
+                color: AppColors.textPrim,
+              ),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              message,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                fontSize: 14,
+                color: AppColors.textSec,
+                height: 1.6,
+              ),
+            ),
+          ],
         ),
       ),
     );
   }
 
-  // ── 가이드 뷰 ─────────────────────────────────────────
-  Widget _buildGuideView() {
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(24),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Container(
-            width: 4,
-            height: 20,
-            decoration: BoxDecoration(
-              color: AppColors.accent,
-              borderRadius: BorderRadius.circular(2),
-            ),
-          ),
-          const SizedBox(height: 12),
-          const Text(
-            'QR 코드를 스캔하세요',
-            style: TextStyle(
-              fontSize: 20,
-              fontWeight: FontWeight.w700,
-              color: AppColors.textPrim,
-              letterSpacing: -0.5,
-            ),
-          ),
-          const SizedBox(height: 10),
-          const Text(
-            'QR 코드의 내용을 분석하여\n피싱 여부와 위험도를 확인합니다.',
-            style: TextStyle(
-              fontSize: 14,
-              color: AppColors.textSec,
-              height: 1.6,
-            ),
-          ),
-          const SizedBox(height: 24),
-          Row(children: [_infoChip(Icons.speed_rounded, '실시간 분석')]),
-        ],
-      ),
-    );
-  }
+  Widget _buildResultView() => AnalysisResultView(result: _result!);
 
-  Widget _infoChip(IconData icon, String label) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
-      decoration: BoxDecoration(
-        color: AppColors.surfaceSub,
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: AppColors.border),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon, size: 14, color: AppColors.accent),
-          const SizedBox(width: 6),
-          Text(
-            label,
-            style: const TextStyle(
-              fontSize: 12,
-              fontWeight: FontWeight.w500,
-              color: AppColors.textSec,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  // ── 에러 뷰 ──────────────────────────────────────────
-  Widget _buildErrorView() {
-    return SingleChildScrollView(
-      key: const Key('analysis-error-scroll'),
-      padding: const EdgeInsets.all(24),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              const Icon(
-                Icons.error_outline_rounded,
-                color: AppColors.danger,
-                size: 22,
-              ),
-              const SizedBox(width: 8),
-              const Flexible(
-                child: Text(
-                  '오류 발생',
-                  style: TextStyle(
-                    fontSize: 18,
-                    fontWeight: FontWeight.w700,
-                    color: AppColors.danger,
-                  ),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 12),
-          Text(
-            _errorMessage ?? '',
-            style: const TextStyle(
-              fontSize: 13,
-              color: AppColors.textSec,
-              height: 1.6,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  // ── 결과 뷰 ──────────────────────────────────────────
-  Widget _buildResultView() {
-    return AnalysisResultView(result: _result!);
-  }
-
-  Widget _buildProgressView() => const Center(
+  Widget _buildProgressView() => Center(
     child: SingleChildScrollView(
-      padding: EdgeInsets.all(24),
+      padding: const EdgeInsets.all(24),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          CircularProgressIndicator(color: Colors.white),
-          SizedBox(height: 20),
-          Text(
+          if (_reduceMotion)
+            const Icon(
+              Icons.hourglass_top_rounded,
+              color: Colors.white,
+              size: 48,
+            )
+          else
+            const SizedBox(
+              width: 64,
+              height: 64,
+              child: CircularProgressIndicator(
+                color: Colors.white,
+                strokeWidth: 3,
+                strokeCap: StrokeCap.round,
+              ),
+            ),
+          const SizedBox(height: 24),
+          const Text(
             'QR 내용 분석 중',
             textAlign: TextAlign.center,
             style: TextStyle(
               color: Colors.white,
-              fontSize: 16,
-              fontWeight: FontWeight.w600,
+              fontSize: 20,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            'QR 내용과 포함 링크를 확인하고 있습니다.',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: Colors.white.withValues(alpha: 0.7),
+              fontSize: 14,
+              height: 1.5,
             ),
           ),
         ],
@@ -816,17 +850,37 @@ class ScanAgainButton extends StatelessWidget {
           padding: EdgeInsets.symmetric(vertical: 14),
           child: Text(
             '다시 스캔하기',
-            style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
           ),
         ),
         style: FilledButton.styleFrom(
           backgroundColor: AppColors.accent,
           foregroundColor: Colors.white,
           shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(12),
+            borderRadius: BorderRadius.circular(16),
           ),
         ),
       ),
     );
   }
+}
+
+class _ScanMaskPainter extends CustomPainter {
+  const _ScanMaskPainter(this.hole);
+  final Rect hole;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final mask = Path()
+      ..fillType = PathFillType.evenOdd
+      ..addRect(Offset.zero & size)
+      ..addRRect(RRect.fromRectAndRadius(hole, const Radius.circular(28)));
+    canvas.drawPath(
+      mask,
+      Paint()..color = Colors.black.withValues(alpha: 0.55),
+    );
+  }
+
+  @override
+  bool shouldRepaint(_ScanMaskPainter oldDelegate) => oldDelegate.hole != hole;
 }

@@ -165,15 +165,19 @@ Future<void> mountPage(
   WidgetTester tester,
   FakeAnalysisClient client, {
   double scale = 1,
+  bool disableAnimations = false,
+  EdgeInsets safePadding = EdgeInsets.zero,
   String endpoint = 'https://analysis.invalid/analyze-qr',
 }) async {
   await tester.pumpWidget(
     MaterialApp(
       theme: ThemeData(useMaterial3: true, colorSchemeSeed: AppColors.accent),
       builder: (context, child) => MediaQuery(
-        data: MediaQuery.of(
-          context,
-        ).copyWith(textScaler: TextScaler.linear(scale)),
+        data: MediaQuery.of(context).copyWith(
+          textScaler: TextScaler.linear(scale),
+          disableAnimations: disableAnimations,
+          padding: safePadding,
+        ),
         child: child!,
       ),
       home: ScanPage(client: client, apiUrl: endpoint),
@@ -199,6 +203,94 @@ void main() {
   tearDown(() async {
     await camera.close();
     MobileScannerPlatform.instance = originalPlatform;
+  });
+
+  for (final size in [
+    const Size(280, 360),
+    const Size(568, 280),
+    const Size(390, 844),
+  ]) {
+    testWidgets('waiting frame and scrollable guide fit $size at 2x text', (
+      tester,
+    ) async {
+      tester.view.physicalSize = size;
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      await mountPage(
+        tester,
+        client,
+        scale: 2,
+        safePadding: const EdgeInsets.fromLTRB(12, 24, 12, 20),
+      );
+      final cameraRect = tester.getRect(find.byKey(const Key('camera-region')));
+      final frame = tester.getRect(find.byKey(const Key('scan-frame')));
+      final guide = tester.getRect(find.byKey(const Key('scan-guide-panel')));
+      final header = tester.getRect(find.byType(AppBar));
+      expect(frame.width, greaterThan(0));
+      expect(frame.width, closeTo(frame.height, 0.001));
+      expect(cameraRect.contains(frame.topLeft), isTrue);
+      expect(cameraRect.contains(frame.bottomRight), isTrue);
+      expect(header.bottom, lessThanOrEqualTo(frame.top));
+      expect(cameraRect.bottom, lessThanOrEqualTo(guide.top));
+      expect(find.byKey(const Key('scan-mask')), findsOneWidget);
+      expect(find.text('Qshing'), findsOneWidget);
+      final scroll = find.descendant(
+        of: find.byKey(const Key('scan-guide-scroll')),
+        matching: find.byType(Scrollable),
+      );
+      await tester.scrollUntilVisible(
+        find.text('Wi-Fi'),
+        80,
+        scrollable: scroll,
+      );
+      expect(find.text('Wi-Fi').hitTestable(), findsOneWidget);
+      expect(client.requests, isEmpty);
+      expect(camera.starts, 1);
+      expect(tester.takeException(), isNull);
+    });
+  }
+
+  testWidgets('reduced motion stops the frame pulse and loading animation', (
+    tester,
+  ) async {
+    Color frameColor() {
+      final frame = tester.widget<Container>(
+        find.byKey(const Key('scan-frame')),
+      );
+      return ((frame.decoration! as BoxDecoration).border! as Border).top.color;
+    }
+
+    await mountPage(tester, client, disableAnimations: true);
+    final fixedColor = frameColor();
+    await tester.pump(const Duration(milliseconds: 700));
+    expect(frameColor(), fixedColor);
+    expect(tester.binding.hasScheduledFrame, isFalse);
+    // Settings can change without starting another camera or listener.
+    await mountPage(tester, client);
+    final animatedColor = frameColor();
+    await tester.pump(const Duration(milliseconds: 700));
+    expect(frameColor(), isNot(animatedColor));
+    expect(camera.starts, 1);
+    await mountPage(tester, client, disableAnimations: true);
+    camera.detect('QR');
+    await frames(tester);
+    expect(find.byIcon(Icons.hourglass_top_rounded), findsOneWidget);
+    expect(find.byType(CircularProgressIndicator), findsNothing);
+    client.complete(0);
+    await frames(tester);
+    await tester.pumpAndSettle();
+    expect(tester.binding.hasScheduledFrame, isFalse);
+    expect(find.byKey(const Key('scan-frame')), findsNothing);
+    await tester.tap(find.byKey(const Key('rescan-button')));
+    await frames(tester);
+    expect(camera.starts, 2);
+    camera.detect('QR');
+    await frames(tester);
+    expect(client.requests, hasLength(2));
+    client.complete(1);
+    await frames(tester);
+    expect(tester.takeException(), isNull);
   });
 
   testWidgets('queued detection error cannot discard an HTTP analysis', (
