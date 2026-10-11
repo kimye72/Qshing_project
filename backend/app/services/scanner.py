@@ -10,6 +10,7 @@ from app.constants import (
     RULESET_VERSION,
     STANDARD_PORT_BY_SCHEME,
 )
+from app.services.brand_domains import GOOGLE_SUPPORTED_DOMAINS
 from app.services.virustotal import get_url_report
 
 
@@ -61,8 +62,8 @@ BRAND_KEYWORDS = ["naver", "kakao", "google", "apple", "paypal"]
 BRAND_SAFE_DOMAINS = {
     "naver": ["naver.com", "www.naver.com", "naver.me"],
     "kakao": ["kakao.com", "www.kakao.com", "kakaocorp.com", "kakaopay.com"],
-    "google": ["google.com", "www.google.com", "google.co.kr"],
-    "apple": ["apple.com", "www.apple.com"],
+    "google": [*GOOGLE_SUPPORTED_DOMAINS, "www.google.com"],
+    "apple": ["apple.com", "www.apple.com", "apple.com.cn"],
     "paypal": ["paypal.com", "www.paypal.com"],
 }
 
@@ -130,6 +131,14 @@ def _is_shortener_domain(domain: str) -> bool:
     return domain in SHORTENER_DOMAINS or any(domain.endswith(f".{item}") for item in SHORTENER_DOMAINS)
 
 
+def _is_official_brand_host(hostname: str, brand: str) -> bool:
+    # Check every explicit domain before considering shorter-domain insertions.
+    return any(
+        hostname == safe or hostname.endswith(f".{safe}")
+        for safe in BRAND_SAFE_DOMAINS.get(brand, [])
+    )
+
+
 def _has_suspicious_brand_domain(hostname: str) -> bool:
     """
     유명 서비스명이 도메인에 포함되어 있지만 공식 도메인이 아닌 경우를 단순 휴리스틱으로 탐지합니다.
@@ -139,8 +148,7 @@ def _has_suspicious_brand_domain(hostname: str) -> bool:
     for brand in BRAND_KEYWORDS:
         if brand not in hostname:
             continue
-        safe_domains = BRAND_SAFE_DOMAINS.get(brand, [])
-        if hostname not in safe_domains and not any(hostname.endswith(f".{safe}") for safe in safe_domains):
+        if not _is_official_brand_host(hostname, brand):
             return True
     return False
 
@@ -154,12 +162,9 @@ def _has_official_domain_insertion(hostname: str) -> bool:
     hostname = hostname.lower().rstrip(".")
     labels = hostname.split(".")
     for brand in BRAND_KEYWORDS:
-        safe_domains = BRAND_SAFE_DOMAINS.get(brand, [])
-        if hostname in safe_domains or any(
-            hostname.endswith(f".{safe}") for safe in safe_domains
-        ):
+        if _is_official_brand_host(hostname, brand):
             continue
-        for safe in safe_domains:
+        for safe in BRAND_SAFE_DOMAINS.get(brand, []):
             safe_labels = safe.split(".")
             for start in range(len(labels) - len(safe_labels)):
                 end = start + len(safe_labels)

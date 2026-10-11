@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from app import main
 from app.constants import ASSUMED_HTTPS_REASON, RULESET_VERSION
 from app.services import scanner, url_cache
+from app.services.brand_domains import GOOGLE_SUPPORTED_DOMAINS
 from test_analyze_qr import make_cache_item, make_db_result
 
 
@@ -39,7 +40,7 @@ class OfficialDomainInsertionTests(unittest.TestCase):
 
     def assert_insertion(self, result, score=35, status="warning"):
         self.assertEqual((result["final_score"], result["status"]), (score, status))
-        self.assertEqual(result["ruleset_version"], "1.4")
+        self.assertEqual(result["ruleset_version"], RULESET_VERSION)
         self.assertTrue(result["analysis_flags"]["suspicious_brand_domain"])
         self.assertTrue(result["analysis_flags"]["official_domain_insertion"])
         self.assertEqual(result["reasons"].count(self.REASON), 1)
@@ -65,7 +66,6 @@ class OfficialDomainInsertionTests(unittest.TestCase):
         return cached
 
     def test_representative_hosts_have_one_strengthened_brand_addition(self):
-        self.assertEqual(RULESET_VERSION, "1.4")
         for host in self.HOSTS:
             with self.subTest(host=host):
                 result = scanner.analyze_url("https://" + host)
@@ -208,7 +208,7 @@ class OfficialDomainInsertionTests(unittest.TestCase):
                             self.assertEqual(result["revalidation_reason"], "ruleset_changed")
                             self.assertFalse(result["cache_hit"])
                             saved = self.write.call_args.args[1]
-                            self.assertEqual((saved["ruleset_version"], saved["final_score"]), ("1.4", 35))
+                            self.assertEqual((saved["ruleset_version"], saved["final_score"]), (RULESET_VERSION, 35))
                             self.assertEqual(cached, before)
                             if context == "direct":
                                 self.assertTrue(result["_history_should_save"])
@@ -264,7 +264,7 @@ class OfficialDomainInsertionTests(unittest.TestCase):
             parent = response.json()
             self.assertFalse(parent["embedded_url_analysis_complete"])
             self.assertEqual(parent["final_score"], max(parent["text_score"], 30))
-            self.assertEqual(parent["embedded_url_results"][0]["ruleset_version"], "1.4")
+            self.assertEqual(parent["embedded_url_results"][0]["ruleset_version"], RULESET_VERSION)
             self.assertEqual(parent["embedded_url_failures"][0]["error_code"], "EMBEDDED_URL_ANALYSIS_FAILED")
             self.assertTrue(parent["embedded_url_failures"][0]["assumed_https"])
             self.assertNotIn("private failure", response.text)
@@ -289,6 +289,237 @@ class OfficialDomainInsertionTests(unittest.TestCase):
         self.assertEqual(result["history_event_type"], "ruleset_reclassified")
         self.assertTrue(result["history_saved"])
         self.assertEqual(cached["ruleset_version"], "1.3")
+
+
+class OfficialCountryDomainTests(unittest.TestCase):
+    URLS = ("https://google.com.au", "https://apple.com.cn")
+    INSERTION_REASON = OfficialDomainInsertionTests.REASON
+
+    def setUp(self):
+        OfficialDomainInsertionTests.setUp(self)
+
+    def assert_official(self, result, score=10, status="safe"):
+        self.assertEqual((result["final_score"], result["status"]), (score, status))
+        self.assertEqual(result["ruleset_version"], "1.5")
+        self.assertFalse(result["analysis_flags"]["suspicious_brand_domain"])
+        self.assertFalse(result["analysis_flags"]["official_domain_insertion"])
+        self.assertNotIn(self.INSERTION_REASON, result["reasons"])
+        self.assertNotIn(OfficialDomainInsertionTests.GENERIC_REASON, result["reasons"])
+
+    def old_cache(self, url, *, version="1.4", malicious=0):
+        delta = 70 if malicious == 3 else 0
+        cached = make_cache_item(
+            url, checked_at=990, domain=url.split("://", 1)[1],
+            ruleset_version=version, local_score=35, vt_score_delta=delta,
+            final_score=min(35 + delta, 100), risk_score=min(35 + delta, 100),
+            status="danger" if delta else "warning", reasons=[self.INSERTION_REASON],
+            analysis_flags={"suspicious_brand_domain": True, "official_domain_insertion": True},
+            vt_available=bool(malicious), vt_malicious=malicious,
+            vt_source="url_report" if malicious else None,
+            vt_lookup_status="available" if malicious else "disabled",
+        )
+        if version is None:
+            cached.pop("ruleset_version")
+        if malicious:
+            cached["vt_checked_at"] = 900
+        return cached
+
+    def test_country_hosts_case_trailing_dot_and_children_drop_to_ten(self):
+        self.assertEqual(RULESET_VERSION, "1.5")
+        for host in (
+            "google.com.au", "apple.com.cn", "GOOGLE.COM.AU.", "APPLE.COM.CN.",
+            "www.google.com.au", "www.apple.com.cn", "m.google.com.au", "m.apple.com.cn",
+        ):
+            with self.subTest(host=host):
+                self.assert_official(scanner.analyze_url("https://" + host))
+                # Even direct insertion checks must exempt the longer domain.
+                self.assertFalse(scanner._has_official_domain_insertion(host))
+
+    def test_every_explicit_google_snapshot_host_and_child_is_exempt(self):
+        self.assertEqual(len(GOOGLE_SUPPORTED_DOMAINS), 187)
+        self.assertEqual(len(set(GOOGLE_SUPPORTED_DOMAINS)), 187)
+        self.assertIn("google.com.au", GOOGLE_SUPPORTED_DOMAINS)
+        for domain in GOOGLE_SUPPORTED_DOMAINS:
+            for host in (domain, "WWW." + domain.upper() + "."):
+                with self.subTest(host=host):
+                    self.assert_official(scanner.analyze_url("https://" + host))
+
+    def test_country_domains_with_other_host_labels_keep_single_strengthened_addition(self):
+        for host in (
+            "google.com.au.evil.invalid", "apple.com.cn.evil.invalid",
+            "GOOGLE.COM.AU.EVIL.INVALID.", "APPLE.COM.CN.EVIL.INVALID.",
+            "google.com.au.apple.com.cn.evil", "www.google.com.au.evil.invalid",
+        ):
+            with self.subTest(host=host):
+                result = scanner.analyze_url("https://" + host)
+                self.assertEqual((result["local_score"], result["status"]), (45, "warning"))
+                self.assertTrue(result["analysis_flags"]["suspicious_brand_domain"])
+                self.assertTrue(result["analysis_flags"]["official_domain_insertion"])
+                self.assertEqual(result["reasons"].count(self.INSERTION_REASON), 1)
+                self.assertTrue(result["analysis_flags"]["excessive_hostname_labels"])
+
+    def test_similar_labels_and_unlisted_suffixes_do_not_inherit_exemptions(self):
+        for host, score, inserted in (
+            ("fakegoogle.com.au", 25, False), ("google-com-au.invalid", 25, False),
+            ("google.comau.invalid", 25, False), ("fakeapple.com.cn", 25, False),
+            ("apple-com-cn.invalid", 25, False), ("apple.comcn.invalid", 25, False),
+            ("google.example", 25, False), ("apple.example", 25, False),
+            # Complete shorter official domains still trigger insertion rules.
+            ("google.com.aux", 35, True), ("apple.com.cnx", 35, True),
+            ("google.com.cn", 35, True), ("apple.com.au", 35, True),
+        ):
+            with self.subTest(host=host):
+                result = scanner.analyze_url("https://" + host)
+                self.assertEqual(result["local_score"], score)
+                self.assertTrue(result["analysis_flags"]["suspicious_brand_domain"])
+                self.assertEqual(result["analysis_flags"]["official_domain_insertion"], inserted)
+
+    def test_country_exceptions_only_remove_brand_points_and_keep_other_signals(self):
+        for url in self.URLS:
+            for changed, score, flag in (
+                (url.replace("https:", "http:"), 30, "non_https"),
+                (url.replace("https://", "https://user@"), 35, "userinfo_in_url"),
+                (url + "/%3Cscript%3E", 25, "sql_xss_pattern_count"),
+                (url + "/?q=union%20select", 35, "sql_xss_pattern_count"),
+            ):
+                with self.subTest(url=changed):
+                    result = scanner.analyze_url(changed)
+                    self.assert_official(result, score, "warning" if score >= 30 else "safe")
+                    self.assertTrue(result["analysis_flags"][flag])
+        report = {
+            "enabled": True, "available": True, "lookup_status": "available",
+            "source": "url_report", "stats": {"malicious": 3, "suspicious": 0},
+        }
+        self.vt.return_value = report
+        for url in self.URLS:
+            result = scanner.analyze_url(url)
+            self.assert_official(result, 80, "danger")
+            self.assertEqual((result["local_score"], result["vt_score_delta"]), (10, 70))
+            self.assertIn(scanner.LOCAL_NO_ADDITIONAL_RISK_REASON, result["reasons"])
+            self.assertIn("VirusTotal 탐지 결과 악성 3건, 의심 0건이 확인되었습니다.", result["reasons"])
+            self.assertNotIn("특별한 위험 요소가 발견되지 않았습니다.", result["reasons"])
+            self.assertEqual(result["reasons"], scanner.analyze_url_with_vt_result(url, report)["reasons"])
+
+    def test_real_direct_sms_and_text_api_returns_current_flags_and_max_score(self):
+        with TestClient(main.app) as client:
+            for url in self.URLS:
+                for path in ("/scan", "/analyze-qr"):
+                    response = client.post(path, json={"url" if path == "/scan" else "content": url})
+                    self.assertEqual(response.status_code, 200)
+                    self.assert_official(response.json())
+                for content, assumed in (
+                    ("확인 " + url, False), ("확인 " + url.removeprefix("https://"), True),
+                    ("SMSTO:01012345678:확인 " + url.removeprefix("https://"), True),
+                    ("SMS:+821012345678?body=" + quote("확인 " + url, safe=""), False),
+                ):
+                    response = client.post("/analyze-qr", json={"content": content})
+                    self.assertEqual(response.status_code, 200)
+                    parent = response.json()
+                    child = parent["embedded_url_results"][0]
+                    self.assert_official(child)
+                    self.assertEqual(parent["final_score"], max(parent["text_score"], 10))
+                    self.assertEqual(child["analysis_url"], url)
+                    self.assertEqual(child["assumed_https"], assumed)
+                    self.assertEqual(child["original_candidates"], [url.removeprefix("https://")] if assumed else [])
+
+    def test_14_and_missing_cache_versions_recalculate_in_direct_and_embedded_contexts(self):
+        with patch.object(url_cache, "URL_CACHE_ENABLED", True):
+            for url in self.URLS:
+                for version in ("1.4", None):
+                    for context in ("direct", "embedded"):
+                        with self.subTest(url=url, version=version, context=context):
+                            cached = self.old_cache(url, version=version)
+                            before = copy.deepcopy(cached)
+                            self.lookup.return_value = cached
+                            analyzer = Mock(wraps=scanner.analyze_url)
+                            result = url_cache.analyze_url_with_cache(url, analyzer=analyzer, analysis_context=context)
+                            self.assert_official(result)
+                            analyzer.assert_called_once_with(url)
+                            self.assertEqual(result["revalidation_reason"], "ruleset_changed")
+                            self.assertFalse(result["cache_hit"])
+                            self.assertEqual(self.write.call_args.args[1]["ruleset_version"], "1.5")
+                            self.assertEqual(cached, before)
+                            if context == "direct":
+                                self.assertEqual(result["_history_event_type"], "ruleset_reclassified")
+                                self.assertTrue(result["_history_should_save"])
+                            else:
+                                self.assertNotIn("_history_should_save", result)
+
+    def test_15_cache_reuse_keeps_request_specific_https_metadata(self):
+        with patch.object(url_cache, "URL_CACHE_ENABLED", True), TestClient(main.app) as client:
+            for url in self.URLS:
+                current = scanner.analyze_url(url)
+                cached = make_cache_item(url, checked_at=990, **{key: current[key] for key in url_cache._CACHE_RESULT_FIELDS})
+                self.lookup.return_value = cached
+                self.vt.reset_mock()
+                self.write.reset_mock()
+                with patch.object(main, "analyze_url", side_effect=AssertionError("must reuse current cache")):
+                    for content, assumed in (("확인 " + url, False), ("확인 " + url.removeprefix("https://"), True)):
+                        response = client.post("/analyze-qr", json={"content": content})
+                        self.assertEqual(response.status_code, 200)
+                        child = response.json()["embedded_url_results"][0]
+                        self.assert_official(child)
+                        self.assertTrue(child["cache_hit"])
+                        self.assertEqual(child["assumed_https"], assumed)
+                        self.assertEqual(ASSUMED_HTTPS_REASON in child["reasons"], assumed)
+                    direct = client.post("/scan", json={"url": url})
+                    self.assertEqual(direct.status_code, 200)
+                    self.assert_official(direct.json())
+                    self.assertEqual(direct.json()["history_skip_reason"], "duplicate_unchanged")
+                self.vt.assert_not_called()
+                self.write.assert_not_called()
+                self.assertNotIn(ASSUMED_HTTPS_REASON, cached["reasons"])
+
+    def test_14_recalculation_failure_never_relabels_old_score_and_keeps_partial_qr(self):
+        with patch.object(url_cache, "URL_CACHE_ENABLED", True), TestClient(main.app) as client:
+            for url in self.URLS:
+                cached = self.old_cache(url)
+                before = copy.deepcopy(cached)
+                self.lookup.side_effect = lambda candidate: cached if candidate == url else None
+                self.write.reset_mock()
+                with patch.object(main, "analyze_url", side_effect=RuntimeError("private failure")):
+                    for path in ("/scan", "/analyze-qr"):
+                        response = client.post(path, json={"url" if path == "/scan" else "content": url})
+                        self.assertEqual(response.status_code, 503)
+                        self.assertNotIn("ruleset_version", response.json())
+                        self.assertNotIn("private failure", response.text)
+                self.write.assert_not_called()
+                def analyze(candidate):
+                    if candidate == url:
+                        raise RuntimeError("private failure")
+                    return scanner.analyze_url(candidate)
+                with patch.object(main, "analyze_url", side_effect=analyze):
+                    response = client.post("/analyze-qr", json={"content": "확인 " + url.removeprefix("https://") + " https://naver.me/AbCd1234"})
+                self.assertEqual(response.status_code, 200)
+                parent = response.json()
+                self.assertFalse(parent["embedded_url_analysis_complete"])
+                self.assertEqual(parent["final_score"], max(parent["text_score"], 30))
+                self.assertEqual(parent["embedded_url_results"][0]["ruleset_version"], "1.5")
+                self.assertEqual(parent["embedded_url_failures"][0]["error_code"], "EMBEDDED_URL_ANALYSIS_FAILED")
+                self.assertTrue(parent["embedded_url_failures"][0]["assumed_https"])
+                self.assertEqual(cached, before)
+
+    def test_old_vt_risk_uses_new_local_score_and_preserves_historical_source(self):
+        with patch.object(url_cache, "URL_CACHE_ENABLED", True), TestClient(main.app) as client:
+            for url in self.URLS:
+                cached = self.old_cache(url, malicious=3)
+                before = copy.deepcopy(cached)
+                self.lookup.return_value = cached
+                for content in (url, "확인 " + url.removeprefix("https://")):
+                    response = client.post("/analyze-qr", json={"content": content})
+                    self.assertEqual(response.status_code, 200)
+                    parent = response.json()
+                    result = parent["embedded_url_results"][0] if parent["embedded_url_results"] else parent
+                    self.assert_official(result, 80, "danger")
+                    self.assertEqual((result["local_score"], result["vt_score_delta"]), (10, 70))
+                    self.assertFalse(result["vt_available"])
+                    self.assertEqual((result["vt_lookup_status"], result["vt_source"]), ("disabled", "cached_report"))
+                    self.assertEqual(result["vt_malicious"], 3)
+                    self.assertTrue(result["analysis_flags"]["historical_reputation_used"])
+                    self.assertIn(scanner.LOCAL_NO_ADDITIONAL_RISK_REASON, result["reasons"])
+                    self.assertTrue(any("재조회는 완료하지 못했습니다" in reason for reason in result["reasons"]))
+                    self.assertEqual(self.write.call_args.kwargs["vt_checked_at"], 900)
+                self.assertEqual(cached, before)
 
 
 if __name__ == "__main__":

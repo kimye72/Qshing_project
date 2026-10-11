@@ -101,13 +101,56 @@ class EmbeddedUrlHistoryTests(unittest.TestCase):
                     ("https://fakepaypal.invalid", False, 25),
                 ):
                     child = children[url]
-                    self.assertEqual(child["ruleset_version"], "1.4")
+                    self.assertEqual(child["ruleset_version"], RULESET_VERSION)
                     self.assertEqual(child["local_score"], score)
                     self.assertTrue(child["analysis_flags"]["suspicious_brand_domain"])
                     self.assertIs(child["analysis_flags"]["official_domain_insertion"], strengthened)
                     self.assertFalse(child["analysis_flags"]["shortener"])
                     self.assertEqual(child["assumed_https"], "naver.me" in url)
                 json.dumps(history, ensure_ascii=False, allow_nan=False)
+
+    def test_country_domain_flags_survive_direct_and_parent_history_api_json(self):
+        with patch.object(scanner, "get_url_report", return_value={
+            "enabled": False, "available": False, "lookup_status": "disabled",
+        }):
+            for inserted_host in ("google.com.au.evil.invalid", "apple.com.cn.evil.invalid"):
+                body = "확인 https://google.com.au apple.com.cn https://" + inserted_host
+                for content in (body, "SMS:+821012345678?body=" + quote(body, safe="")):
+                    before = self.table.put_count
+                    analysis, history = self.analyze_and_list(content)
+                    self.assertEqual(self.table.put_count, before + 1)
+                    self.assertEqual(history["embedded_url_results"], analysis["embedded_url_results"])
+                    self.assertTrue(history["embedded_url_analysis_complete"])
+                    self.assertEqual(history["final_score"], max(analysis["text_score"], 45))
+                    children = {child["analysis_url"]: child for child in history["embedded_url_results"]}
+                    for url, inserted, score in (
+                        ("https://google.com.au", False, 10),
+                        ("https://apple.com.cn", False, 10),
+                        ("https://" + inserted_host, True, 45),
+                    ):
+                        child = children[url]
+                        self.assertEqual(child["ruleset_version"], "1.5")
+                        self.assertEqual(child["local_score"], score)
+                        self.assertIs(child["analysis_flags"]["suspicious_brand_domain"], inserted)
+                        self.assertIs(child["analysis_flags"]["official_domain_insertion"], inserted)
+                        self.assertEqual(child["assumed_https"], url == "https://apple.com.cn")
+                    json.dumps(history, ensure_ascii=False, allow_nan=False)
+            with TestClient(main.app) as client:
+                for host, inserted, score in (
+                    ("google.com.au", False, 10), ("apple.com.cn", False, 10),
+                    ("google.com.au.evil.invalid", True, 45), ("apple.com.cn.evil.invalid", True, 45),
+                ):
+                    before = self.table.put_count
+                    response = client.post("/scan", json={"url": "https://" + host})
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(self.table.put_count, before + 1)
+                    listed = client.get("/scans", headers={"X-Admin-Key": "offline-admin"})
+                    self.assertEqual(listed.status_code, 200)
+                    history = next(item for item in listed.json()["items"] if item["scan_id"] == response.json()["scan_id"])
+                    self.assertEqual(history["local_score"], score)
+                    self.assertEqual(history["ruleset_version"], "1.5")
+                    self.assertIs(history["analysis_flags"]["official_domain_insertion"], inserted)
+                    self.assertEqual(history["embedded_url_results"], [])
 
     def test_sms_and_text_results_survive_store_list_and_api_json(self):
         body = f"확인: {self.EXPLICIT} {self.CANDIDATE}"

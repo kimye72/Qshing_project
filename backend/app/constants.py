@@ -1,4 +1,4 @@
-RULESET_VERSION = "1.4"
+RULESET_VERSION = "1.5"
 MAX_EMBEDDED_URLS_ANALYZED = 3
 MAX_URL_CANDIDATES = 10
 # Routing policy only: URL/non-URL score rules remain unchanged.

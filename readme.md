@@ -47,6 +47,7 @@ Qshing_project/
 │  │  └─ services/
 │  │     ├─ qr_analyzer.py         # 유형 분류·구조형 파싱·후보 검증
 │  │     ├─ scanner.py             # URL 점수 규칙
+│  │     ├─ brand_domains.py       # Google 공식 명시 도메인 정적 목록
 │  │     ├─ virustotal.py          # 리포트 조회·조건부 제출
 │  │     ├─ url_cache.py           # 버전 검증·직접 URL 이력 정책
 │  │     ├─ database.py            # 이력 저장·최신 목록·통계
@@ -87,11 +88,13 @@ Qshing_project/
 
 ## QR 분석과 판정
 
-URL 규칙 버전은 **`RULESET_VERSION=1.4`**입니다. HTTP, IP 호스트, 길이, 단축 URL, userinfo, 인코딩·위험 패턴, Punycode 호스트, 비표준 포트 등을 검사합니다. 브랜드 사칭은 파싱한 호스트의 구체적인 브랜드 식별자를 기준으로 하며, 공식 도메인 예외도 정확한 호스트 또는 점으로 구분된 하위 도메인에만 적용합니다. 공식 도메인도 다른 위험 검사를 수행합니다. 일반 단어와 약한 행사 키워드의 점수·민감도 한계는 [URL 규칙 정책](backend/URL_RULESET_POLICY.md)을 참고하세요.
+URL 규칙 버전은 **`RULESET_VERSION=1.5`**입니다. HTTP, IP 호스트, 길이, 단축 URL, userinfo, 인코딩·위험 패턴, Punycode 호스트, 비표준 포트 등을 검사합니다. 브랜드 사칭은 파싱한 호스트의 구체적인 브랜드 식별자를 기준으로 하며, 공식 도메인 예외도 정확한 호스트 또는 점으로 구분된 하위 도메인에만 적용합니다. 공식 도메인도 다른 위험 검사를 수행합니다. 일반 단어와 약한 행사 키워드의 점수·민감도 한계는 [URL 규칙 정책](backend/URL_RULESET_POLICY.md)을 참고하세요.
 
 1.3에서는 `kakaopay.com`과 `naver.me`를 해당 브랜드의 공식 도메인 예외에 추가했습니다. 예외는 브랜드 가산에만 적용하며 HTTP·userinfo·위험 패턴·VT 검사는 유지합니다. `naver.me`에는 기존 단축 URL 20점을 적용해 VT 비활성 기준 30점 `warning`이며, 공식 단축 서비스도 최종 연결 대상의 안전성을 보장하지 않습니다. 기존 단축 URL 사유와 함께 최종 목적지를 확인하지 않았다고 안내하며 리디렉션 추적·주소 접속은 수행하지 않습니다. 제공받은 [공식 근거와 1.2→1.3 비교 기록](backend/URL_RULESET_POLICY.md#url-규칙-13)은 링크에 접속하지 않고 기록했습니다.
 
-1.4에서는 hostname 안의 완전한 공식 도메인 라벨 뒤에 다른 호스트 라벨이 이어지는 구조를 구분합니다. 일반 브랜드 가산 15점과 강화 가산 25점 중 하나만 적용하며, 여러 브랜드가 겹쳐도 한 번만 가산합니다. `kakaopay.com.evil.invalid`, `naver.me.evil.invalid`, `paypal.com.evil.invalid`는 VT 비활성·다른 신호 없음 기준 25점 `safe`에서 35점 `warning`으로 바뀝니다. 기존 브랜드 플래그와 `official_domain_insertion` 플래그, ‘공식 도메인 형태 뒤에 다른 호스트 라벨이 이어져 있습니다.’라는 사유를 제공합니다. 정상 공식 호스트·해당 브랜드의 하위 도메인 예외는 유지하고 경로·쿼리·userinfo 문자열에는 강화 규칙을 적용하지 않습니다. 유사 철자·등록 도메인·실제 소유권은 판별하지 않으며, 상세 범위와 오탐 가능성은 [1.4 정책](backend/URL_RULESET_POLICY.md#url-규칙-14)에 있습니다. 신선한 1.4 캐시는 재사용하고 이전·누락 버전은 재계산하며, 실패 시 과거 점수를 현재 버전으로 표시하지 않습니다.
+1.4에서는 hostname 안의 완전한 공식 도메인 라벨 뒤에 다른 호스트 라벨이 이어지는 구조를 구분합니다. 일반 브랜드 가산 15점과 강화 가산 25점 중 하나만 적용하며, 여러 브랜드가 겹쳐도 한 번만 가산합니다. `kakaopay.com.evil.invalid`, `naver.me.evil.invalid`, `paypal.com.evil.invalid`는 VT 비활성·다른 신호 없음 기준 25점 `safe`에서 35점 `warning`으로 바뀝니다. 기존 브랜드 플래그와 `official_domain_insertion` 플래그, ‘공식 도메인 형태 뒤에 다른 호스트 라벨이 이어져 있습니다.’라는 사유를 제공합니다. 정상 공식 호스트·해당 브랜드의 하위 도메인 예외는 유지하고 경로·쿼리·userinfo 문자열에는 강화 규칙을 적용하지 않습니다. 유사 철자·등록 도메인·실제 소유권은 판별하지 않으며, 상세 범위와 오탐 가능성은 [1.4 정책](backend/URL_RULESET_POLICY.md#url-규칙-14)에 있습니다.
+
+1.5에서는 2026-10-11에 확인한 Google 공식 명시 목록 187개와 확인된 Apple의 `apple.com.cn`을 브랜드 예외에 반영했습니다. 전체 Google 목록은 [brand_domains.py](backend/app/services/brand_domains.py)에 정적으로 저장하며 실행 중 외부 목록 조회는 없습니다. 모든 명시 주소의 정확한 호스트·점 경계 하위 도메인 예외를 삽입 검사보다 먼저 적용해 `google.com.au`, `apple.com.cn`은 VT 비활성·다른 신호 없음 기준 35점 `warning`에서 10점 `safe`로 바뀝니다. 두 주소 뒤의 `evil.invalid`는 강화 대상이며 기존 깊이 가산까지 포함해 45점입니다. 임의의 `google.*`·`apple.*`를 허용하지 않고 HTTP·userinfo·위험 패턴·VT 검사도 유지합니다. 신선한 1.5 캐시는 재사용하고 이전·누락 버전은 재계산하며 실패 시 과거 점수를 현재 버전으로 표시하지 않습니다. 정적 목록은 이후 변경을 자동 반영하지 않으므로 수동 검토·갱신이 필요합니다. [1.5 공식 근거·반영 범위·한계](backend/URL_RULESET_POLICY.md#url-규칙-15)를 참고하세요.
 
 일반 텍스트는 포함 링크를 분석합니다. `SMS`, SMS colon-message, `SMSTO`, `mailto`는 **원시 필드 경계를 먼저 분리한 뒤 필요한 값을 디코딩하여 본문 링크만 분석**합니다. 수신자·메일 주소·제목·Wi-Fi SSID의 도메인을 본문 링크로 취급하지 않으며, 인코딩된 `&`, `=`, `?`로 바깥 필드 경계를 다시 나누지 않습니다.
 
@@ -276,7 +279,7 @@ export DYNAMODB_ENABLED=false URL_CACHE_ENABLED=false AWS_EC2_METADATA_DISABLED=
 위 설정을 적용한 **동일 셸**에서 공개 모듈을 명시적으로 실행합니다. **PowerShell·Bash 공통**:
 
 ```text
-python -m unittest test_analyze_qr test_analysis_budget test_direct_url_history test_embedded_url_history test_scan_history_reads
+python -m unittest test_analyze_qr test_analysis_budget test_direct_url_history test_embedded_url_history test_scan_history_reads test_official_domain_insertion
 ```
 
 테스트는 VT·DynamoDB를 mock하고 시간 예산은 가짜 시계로 확인합니다. 연구·study 디렉터리는 수집하지 않습니다. 실제 위험 URL 접속·VT 제출·운영 API 호출 결과를 검증한 것이 아닙니다.
