@@ -82,6 +82,33 @@ class EmbeddedUrlHistoryTests(unittest.TestCase):
         self.assertEqual(set(database._EMBEDDED_URL_FAILURE_FIELDS),
                          set(EmbeddedUrlFailure.model_fields))
 
+    def test_official_domain_insertion_flag_survives_parent_history_and_json(self):
+        body = "확인 https://kakaopay.com.evil.invalid naver.me.evil.invalid https://fakepaypal.invalid"
+        with patch.object(scanner, "get_url_report", return_value={
+            "enabled": False, "available": False, "lookup_status": "disabled",
+        }):
+            for content in (body, "SMS:+821012345678?body=" + quote(body, safe="")):
+                before = self.table.put_count
+                analysis, history = self.analyze_and_list(content)
+                self.assertEqual(self.table.put_count, before + 1)
+                self.assertEqual(history["embedded_url_results"], analysis["embedded_url_results"])
+                self.assertTrue(history["embedded_url_analysis_complete"])
+                self.assertEqual(history["final_score"], max(analysis["text_score"], 35))
+                children = {child["analysis_url"]: child for child in history["embedded_url_results"]}
+                for url, strengthened, score in (
+                    ("https://kakaopay.com.evil.invalid", True, 35),
+                    ("https://naver.me.evil.invalid", True, 35),
+                    ("https://fakepaypal.invalid", False, 25),
+                ):
+                    child = children[url]
+                    self.assertEqual(child["ruleset_version"], "1.4")
+                    self.assertEqual(child["local_score"], score)
+                    self.assertTrue(child["analysis_flags"]["suspicious_brand_domain"])
+                    self.assertIs(child["analysis_flags"]["official_domain_insertion"], strengthened)
+                    self.assertFalse(child["analysis_flags"]["shortener"])
+                    self.assertEqual(child["assumed_https"], "naver.me" in url)
+                json.dumps(history, ensure_ascii=False, allow_nan=False)
+
     def test_sms_and_text_results_survive_store_list_and_api_json(self):
         body = f"확인: {self.EXPLICIT} {self.CANDIDATE}"
         contents = (

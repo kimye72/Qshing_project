@@ -145,6 +145,29 @@ def _has_suspicious_brand_domain(hostname: str) -> bool:
     return False
 
 
+def _has_official_domain_insertion(hostname: str) -> bool:
+    """Find complete official-domain labels followed by more host labels.
+
+    Use the same per-brand official-host exceptions as the generic brand rule.
+    This describes URL structure, not registered ownership or maliciousness.
+    """
+    hostname = hostname.lower().rstrip(".")
+    labels = hostname.split(".")
+    for brand in BRAND_KEYWORDS:
+        safe_domains = BRAND_SAFE_DOMAINS.get(brand, [])
+        if hostname in safe_domains or any(
+            hostname.endswith(f".{safe}") for safe in safe_domains
+        ):
+            continue
+        for safe in safe_domains:
+            safe_labels = safe.split(".")
+            for start in range(len(labels) - len(safe_labels)):
+                end = start + len(safe_labels)
+                if labels[start:end] == safe_labels and labels[end]:
+                    return True
+    return False
+
+
 def _get_local_heuristic_score(url: str, domain: str, decoded_url: str) -> tuple[int, list[str], dict]:
     """외부 API 없이 URL 문자열만 보고 계산하는 보조 위험 점수입니다."""
     risk_score = 10
@@ -162,6 +185,7 @@ def _get_local_heuristic_score(url: str, domain: str, decoded_url: str) -> tuple
         "low_confidence_keyword_count": 0,
         "sql_xss_pattern_count": 0,
         "suspicious_brand_domain": False,
+        "official_domain_insertion": False,
         "punycode_hostname": False,
         "nonstandard_port": False,
         "explicit_port": None,
@@ -264,9 +288,15 @@ def _get_local_heuristic_score(url: str, domain: str, decoded_url: str) -> tuple
         reasons.append("단축 URL의 최종 목적지는 확인하지 않았습니다.")
 
     if _has_suspicious_brand_domain(hostname):
-        risk_score += 15
+        inserted_official_domain = _has_official_domain_insertion(hostname)
+        risk_score += 25 if inserted_official_domain else 15
         flags["suspicious_brand_domain"] = True
-        reasons.append("유명 서비스명을 포함하지만 공식 도메인으로 보기 어려운 주소입니다.")
+        flags["official_domain_insertion"] = inserted_official_domain
+        reasons.append(
+            "공식 도메인 형태 뒤에 다른 호스트 라벨이 이어져 있습니다."
+            if inserted_official_domain else
+            "유명 서비스명을 포함하지만 공식 도메인으로 보기 어려운 주소입니다."
+        )
 
     for pattern, reason in SQL_XSS_PATTERNS:
         if re.search(pattern, decoded_lower, flags=re.IGNORECASE):

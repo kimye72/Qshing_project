@@ -92,7 +92,8 @@ _EMBEDDED_URL_FLAG_FIELDS = frozenset({
     "decoded_changed", "non_https", "disallowed_scheme", "ip_address_host",
     "private_or_local_host", "long_url", "shortener", "userinfo_in_url",
     "suspicious_keyword_count", "low_confidence_keyword_count",
-    "sql_xss_pattern_count", "suspicious_brand_domain", "punycode_hostname",
+    "sql_xss_pattern_count", "suspicious_brand_domain", "official_domain_insertion",
+    "punycode_hostname",
     "nonstandard_port", "explicit_port", "excessive_hostname_labels",
     "hostname_label_count", "historical_reputation_used", "analysis_budget_exhausted",
 })

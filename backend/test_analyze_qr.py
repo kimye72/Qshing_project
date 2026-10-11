@@ -242,11 +242,11 @@ class UrlBrandAndKeywordTests(unittest.TestCase):
 
     def test_external_brand_hosts_do_not_inherit_official_domain_exceptions(self):
         for host, score in (
-            ("paypal.com.evil.invalid", 25), ("fakepaypal.com", 25),
+            ("paypal.com.evil.invalid", 35), ("fakepaypal.com", 25),
             ("notpaypal.com", 25), ("paypal-com.invalid", 25),
-            ("paypal.invalid", 25), ("google.co.kr.evil.invalid", 35),
+            ("paypal.invalid", 25), ("google.co.kr.evil.invalid", 45),
             ("fakegoogle.co.kr", 25), ("google-co-kr.invalid", 25),
-            ("naver.com.evil.invalid", 25),
+            ("naver.com.evil.invalid", 35),
         ):
             with self.subTest(host=host):
                 result = analyze_url("https://" + host)
@@ -338,7 +338,7 @@ class UrlBrandAndKeywordTests(unittest.TestCase):
     def test_external_brand_with_credentials_or_reward_tokens_still_warns(self):
         for url, score in (
             ("https://fakepaypal.invalid/login", 35),
-            ("https://paypal.com.evil.invalid/login", 35),
+            ("https://paypal.com.evil.invalid/login", 45),
             ("https://fakepaypal.invalid/event/free", 35),
             ("http://fakepaypal.invalid/free-gift", 55),
         ):
@@ -4230,7 +4230,7 @@ class OfficialBrandDomain13Tests(unittest.TestCase):
 
     def assert_official_result(self, result, score, status, shortener):
         self.assertEqual((result["final_score"], result["status"]), (score, status))
-        self.assertEqual(result["ruleset_version"], "1.3")
+        self.assertEqual(result["ruleset_version"], RULESET_VERSION)
         self.assertFalse(result["analysis_flags"]["suspicious_brand_domain"])
         self.assertNotIn(self.BRAND_REASON, result["reasons"])
         self.assertEqual(result["analysis_flags"]["shortener"], shortener)
@@ -4239,7 +4239,6 @@ class OfficialBrandDomain13Tests(unittest.TestCase):
             self.assertIn(self.DESTINATION_REASON, result["reasons"])
 
     def test_official_domains_have_expected_local_scores_and_reasons(self):
-        self.assertEqual(RULESET_VERSION, "1.3")
         for url, score, status, shortener in self.CASES:
             with self.subTest(url=url):
                 result = analyze_url(url)
@@ -4262,14 +4261,20 @@ class OfficialBrandDomain13Tests(unittest.TestCase):
                 self.assert_official_result(analyze_url("https://" + host), score, status, shortener)
 
     def test_deceptive_hosts_and_path_names_do_not_inherit_exceptions(self):
-        for host in (
-            "kakaopay.com.evil.invalid", "fakekakaopay.invalid",
-            "notkakaopay.com", "naver.me.evil.invalid", "fakenaver.me", "naver.mee",
+        for host, inserted in (
+            ("kakaopay.com.evil.invalid", True), ("fakekakaopay.invalid", False),
+            ("notkakaopay.com", False), ("naver.me.evil.invalid", True),
+            ("fakenaver.me", False), ("naver.mee", False),
         ):
             with self.subTest(host=host):
                 result = analyze_url("https://" + host)
                 self.assertTrue(result["analysis_flags"]["suspicious_brand_domain"])
-                self.assertIn(self.BRAND_REASON, result["reasons"])
+                self.assertEqual(result["analysis_flags"]["official_domain_insertion"], inserted)
+                expected_reason = (
+                    "공식 도메인 형태 뒤에 다른 호스트 라벨이 이어져 있습니다."
+                    if inserted else self.BRAND_REASON
+                )
+                self.assertIn(expected_reason, result["reasons"])
                 self.assertFalse(result["analysis_flags"]["shortener"])
         for url in (
             "https://fakekakaopay.invalid/kakaopay.com",
@@ -4358,7 +4363,7 @@ class OfficialBrandDomain13Tests(unittest.TestCase):
                             self.assertEqual(result["revalidation_reason"], "ruleset_changed")
                             self.assertFalse(result["cache_hit"])
                             saved = self.write.call_args.args[1]
-                            self.assertEqual((saved["ruleset_version"], saved["final_score"]), ("1.3", score))
+                            self.assertEqual((saved["ruleset_version"], saved["final_score"]), (RULESET_VERSION, score))
                             self.assertEqual(cached, before)
                             if context == "direct":
                                 self.assertTrue(result["_history_should_save"])
