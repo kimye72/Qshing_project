@@ -57,7 +57,7 @@ class QrPhishingApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'QR 피싱 방지 시스템',
+      title: 'Qshing',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
@@ -448,7 +448,7 @@ class _ScanPageState extends State<ScanPage>
             const SizedBox(width: 8),
             const Flexible(
               child: Text(
-                'QR 피싱 방지 시스템',
+                'Qshing',
                 maxLines: 2,
                 style: TextStyle(
                   color: Colors.white,

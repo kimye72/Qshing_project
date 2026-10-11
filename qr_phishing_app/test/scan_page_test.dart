@@ -298,7 +298,7 @@ void main() {
       expect(jsonDecode(request.body), {'content': '확인: example.invalid/Path'});
       client.complete(0);
       await frames(tester);
-      expect(find.text('QR 피싱 방지 시스템'), findsOneWidget);
+      expect(find.text('Qshing'), findsOneWidget);
       expect(find.text('낮은 위험'), findsOneWidget);
       expect(find.byType(MobileScanner), findsNothing);
       final button = find.byKey(const Key('rescan-button'));
