@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:mobile_scanner/mobile_scanner.dart';
@@ -262,228 +263,244 @@ class _ScanPageState extends State<ScanPage> with TickerProviderStateMixin {
     }
   }
 
+
+  // ── [디버그 전용] 카메라 없이 화면 미리보기 (작업 끝나면 삭제) ──
+  void _debugPreview(String kind) {
+    if (!kDebugMode) return;
+    setState(() {
+      _isProcessing = false;
+      _result = null;
+      _errorMessage = null;
+      switch (kind) {
+        case 'loading':
+          _isProcessing = true;
+          break;
+        case 'error':
+          _errorMessage = '서버 응답 시간이 초과되었습니다.\n잠시 후 다시 시도해주세요.';
+          break;
+        case 'safe':
+          _result = {
+            'qr_type': 'url',
+            'raw_content_preview': 'https://www.google.com/',
+            'risk_score': 5,
+            'status': 'safe',
+            'message': '안전한 URL로 판단됩니다.',
+            'reasons': ['특별한 위험 요소가 발견되지 않았습니다.'],
+          };
+          break;
+        case 'warning':
+          _result = {
+            'qr_type': 'phone_text',
+            'raw_content_preview': '고객센터 010-****-5678로 인증번호를 알려주세요',
+            'risk_score': 55,
+            'status': 'warning',
+            'message': '주의가 필요한 QR입니다. 내용을 확인한 뒤 신중히 진행하세요.',
+            'reasons': [
+              '전화번호가 포함되어 있습니다.',
+              '인증번호 문구가 포함되어 있습니다.',
+              '고객센터 문구가 포함되어 있습니다.',
+            ],
+          };
+          break;
+        case 'danger':
+          _result = {
+            'qr_type': 'url',
+            'raw_content_preview': 'http://192.168.0.1/login-bank-update',
+            'risk_score': 85,
+            'status': 'danger',
+            'message': '위험한 QR입니다. 접속하지 마세요.',
+            'reasons': [
+              'HTTP를 사용합니다.',
+              'IP 주소가 직접 사용되었습니다.',
+              '의심 키워드 포함: login',
+              '의심 키워드 포함: bank',
+            ],
+            'vt_available': true,
+            'vt_source': 'url_report',
+          };
+          break;
+      }
+    });
+  }
+
+  static const Color _ink = Color(0xFF0F172A);
+
   // ── 빌드 ─────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
+    final showResult = _result != null;
+    final showError = _errorMessage != null;
+    final scanning = !showResult && !showError;
+
     return Scaffold(
-      backgroundColor: Colors.black,
-      appBar: AppBar(
-        backgroundColor: Colors.black,
-        foregroundColor: Colors.white,
-        title: Row(
+      backgroundColor: _ink,
+      body: Stack(
+        fit: StackFit.expand,
+        children: [
+          // 카메라 (항상 유지: 스캔 로직 그대로)
+          MobileScanner(
+            controller: _scannerController,
+            onDetect: (BarcodeCapture capture) {
+              if (_isProcessing || _result != null || _errorMessage != null) return;
+              final barcodes = capture.barcodes;
+              if (barcodes.isEmpty) return;
+              final value = barcodes.first.rawValue;
+              if (value == null || value.isEmpty) return;
+              _scannerController.stop();
+              _analyzeQRContent(value);
+            },
+          ),
+
+          if (scanning) _buildScanLayer(),
+          if (_isProcessing) _buildLoadingLayer(),
+          if (showResult) _buildResultScreen(),
+          if (showError) _buildErrorScreen(),
+
+          // 디버그 미리보기 메뉴
+          if (kDebugMode)
+            SafeArea(
+              child: Align(
+                alignment: Alignment.topRight,
+                child: Padding(
+                  padding: const EdgeInsets.all(8),
+                  child: PopupMenuButton<String>(
+                    icon: const Icon(Icons.bug_report_rounded),
+                    iconColor: scanning ? Colors.white : AppColors.textHint,
+                    tooltip: '화면 미리보기',
+                    onSelected: (v) => v == 'reset' ? _resetScan() : _debugPreview(v),
+                    itemBuilder: (_) => const [
+                      PopupMenuItem(value: 'loading', child: Text('로딩 화면')),
+                      PopupMenuItem(value: 'safe', child: Text('결과: 안전')),
+                      PopupMenuItem(value: 'warning', child: Text('결과: 주의')),
+                      PopupMenuItem(value: 'danger', child: Text('결과: 위험')),
+                      PopupMenuItem(value: 'error', child: Text('오류 화면')),
+                      PopupMenuItem(value: 'reset', child: Text('스캔 화면으로')),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  // ── 스캔 화면 ─────────────────────────────────────────
+  Widget _buildScanLayer() {
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        LayoutBuilder(builder: (context, c) {
+          final rect = Rect.fromCenter(
+            center: Offset(c.maxWidth / 2, c.maxHeight * 0.36),
+            width: 250, height: 250,
+          );
+          return Stack(children: [
+            Positioned.fill(
+              child: IgnorePointer(child: CustomPaint(painter: _ScanMaskPainter(rect))),
+            ),
+            Positioned.fromRect(
+              rect: rect,
+              child: IgnorePointer(
+                child: AnimatedBuilder(
+                  animation: _pulseAnim,
+                  builder: (_, __) => Container(
+                    decoration: BoxDecoration(
+                      border: Border.all(
+                        color: Colors.white.withOpacity(0.45 + 0.45 * _pulseAnim.value),
+                        width: 2,
+                      ),
+                      borderRadius: BorderRadius.circular(28),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ]);
+        }),
+
+                // 상단 로고 (좌측 상단 고정)
+        Positioned(
+          top: 0, left: 0, right: 0,
+          child: SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(20, 14, 20, 0),
+              child: Row(children: [
+                Container(
+                  width: 34, height: 34,
+                  decoration: BoxDecoration(
+                    color: Colors.white.withOpacity(0.14),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: const Icon(Icons.shield_outlined, size: 20, color: Colors.white),
+                ),
+                const SizedBox(width: 10),
+                const Text('QR 피싱 방지',
+                  style: TextStyle(
+                    color: Colors.white, fontSize: 17,
+                    fontWeight: FontWeight.w700, letterSpacing: -0.3,
+                  ),
+                ),
+              ]),
+            ),
+          ),
+        ),
+
+        // 하단 안내 패널
+        Positioned(left: 0, right: 0, bottom: 0, child: _buildGuidePanel()),
+      ],
+    );
+  }
+
+  Widget _buildGuidePanel() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(24, 24, 24, 20),
+      decoration: const BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+      ),
+      child: SafeArea(
+        top: false,
+        child: Column(
           mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Container(
-              width: 28, height: 28,
-              decoration: BoxDecoration(
-                color: AppColors.dangerBg,
-                border: Border.all(color: AppColors.danger.withOpacity(0.4)),
-                borderRadius: BorderRadius.circular(6),
+            Row(children: [
+              Container(
+                width: 44, height: 44,
+                decoration: BoxDecoration(
+                  color: AppColors.accentBg,
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: const Icon(Icons.verified_user_rounded,
+                    color: AppColors.accent, size: 24),
               ),
-              child: const Icon(Icons.qr_code_scanner_rounded,
-                  size: 16, color: AppColors.danger),
-            ),
-            const SizedBox(width: 8),
-            const Text('QR 피싱 방지 시스템',
-              style: TextStyle(
-                color: Colors.white,
-                fontSize: 16,
-                fontWeight: FontWeight.w600,
-                letterSpacing: -0.3,
+              const SizedBox(width: 14),
+              const Expanded(
+                child: Text('QR 코드를 네모 안에 맞춰주세요',
+                  style: TextStyle(
+                    fontSize: 18, fontWeight: FontWeight.w800,
+                    color: AppColors.textPrim, letterSpacing: -0.4,
+                  ),
+                ),
               ),
+            ]),
+            const SizedBox(height: 12),
+            const Text(
+              'QR을 자동으로 열지 않고, 먼저 위험도를 분석합니다.',
+              style: TextStyle(fontSize: 14, color: AppColors.textSec, height: 1.5),
             ),
+            const SizedBox(height: 16),
+            Wrap(spacing: 8, runSpacing: 8, children: [
+              _infoChip(Icons.link_rounded, 'URL'),
+              _infoChip(Icons.phone_outlined, '전화번호'),
+              _infoChip(Icons.sms_outlined, '문자'),
+              _infoChip(Icons.mail_outline_rounded, '이메일'),
+              _infoChip(Icons.wifi_rounded, 'Wi-Fi'),
+            ]),
           ],
         ),
-      ),
-      body: Column(
-        children: [
-          // ── 카메라 스캔 영역 ──
-          Expanded(
-            flex: 5,
-            child: Stack(
-              children: [
-                MobileScanner(
-                  controller: _scannerController,
-                  onDetect: (BarcodeCapture capture) {
-                    if (_isProcessing || _result != null || _errorMessage != null) return;
-                    final barcodes = capture.barcodes;
-                    if (barcodes.isEmpty) return;
-                    final value = barcodes.first.rawValue;
-                    if (value == null || value.isEmpty) return;
-                    _scannerController.stop();
-                    _analyzeQRContent(value);
-                  },
-                ),
-
-                // 스캔 프레임
-                if (!_isProcessing)
-                  Center(
-                    child: AnimatedBuilder(
-                      animation: _pulseAnim,
-                      builder: (_, __) => Container(
-                        width: 220, height: 220,
-                        decoration: BoxDecoration(
-                          border: Border.all(
-                            color: Colors.white.withOpacity(_pulseAnim.value),
-                            width: 2.5,
-                          ),
-                          borderRadius: BorderRadius.circular(16),
-                        ),
-                        child: Stack(children: [
-                          _corner(0, 0, true,  true),
-                          _corner(0, 0, true,  false),
-                          _corner(0, 0, false, true),
-                          _corner(0, 0, false, false),
-                        ]),
-                      ),
-                    ),
-                  ),
-
-                // 스캔 가이드 텍스트
-                if (!_isProcessing && _result == null && _errorMessage == null)
-                  Positioned(
-                    bottom: 24, left: 0, right: 0,
-                    child: Center(
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 18, vertical: 10),
-                        decoration: BoxDecoration(
-                          color: Colors.black.withOpacity(0.55),
-                          borderRadius: BorderRadius.circular(20),
-                        ),
-                        child: const Text(
-                          'QR 코드를 네모 안에 맞춰주세요',
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontSize: 13,
-                            fontWeight: FontWeight.w500,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-
-                // 로딩 오버레이
-                if (_isProcessing)
-                  Container(
-                    color: Colors.black.withOpacity(0.7),
-                    child: Center(
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Container(
-                            width: 72, height: 72,
-                            decoration: BoxDecoration(
-                              color: Colors.white.withOpacity(0.1),
-                              shape: BoxShape.circle,
-                              border: Border.all(
-                                  color: Colors.white.withOpacity(0.2)),
-                            ),
-                            child: const Padding(
-                              padding: EdgeInsets.all(18),
-                              child: CircularProgressIndicator(
-                                color: Colors.white,
-                                strokeWidth: 2.5,
-                              ),
-                            ),
-                          ),
-                          const SizedBox(height: 20),
-                          const Text('QR 내용 분석 중',
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 16,
-                              fontWeight: FontWeight.w600,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-              ],
-            ),
-          ),
-
-          // ── 결과 패널 ──
-          Expanded(
-            flex: 4,
-            child: Container(
-              width: double.infinity,
-              decoration: const BoxDecoration(
-                color: AppColors.surface,
-                borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-              ),
-              child: _errorMessage != null
-                  ? _buildErrorView()
-                  : _result == null
-                      ? _buildGuideView()
-                      : _buildResultView(),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  // 모서리 장식
-  Widget _corner(double top, double left, bool isTop, bool isLeft) {
-    return Positioned(
-      top:    isTop  ? 0 : null,
-      bottom: isTop  ? null : 0,
-      left:   isLeft ? 0 : null,
-      right:  isLeft ? null : 0,
-      child: Container(
-        width: 24, height: 24,
-        decoration: BoxDecoration(
-          border: Border(
-            top:    isTop  ? const BorderSide(color: AppColors.accent, width: 3) : BorderSide.none,
-            bottom: !isTop ? const BorderSide(color: AppColors.accent, width: 3) : BorderSide.none,
-            left:   isLeft  ? const BorderSide(color: AppColors.accent, width: 3) : BorderSide.none,
-            right:  !isLeft ? const BorderSide(color: AppColors.accent, width: 3) : BorderSide.none,
-          ),
-        ),
-      ),
-    );
-  }
-
-  // ── 가이드 뷰 ─────────────────────────────────────────
-  Widget _buildGuideView() {
-    return Padding(
-      padding: const EdgeInsets.all(24),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Container(
-            width: 4, height: 20,
-            decoration: BoxDecoration(
-              color: AppColors.accent,
-              borderRadius: BorderRadius.circular(2),
-            ),
-          ),
-          const SizedBox(height: 12),
-          const Text('QR 코드를 스캔하세요',
-            style: TextStyle(
-              fontSize: 20,
-              fontWeight: FontWeight.w700,
-              color: AppColors.textPrim,
-              letterSpacing: -0.5,
-            ),
-          ),
-          const SizedBox(height: 10),
-          const Text(
-            'QR 코드의 내용을 분석하여\n피싱 여부와 위험도를 확인합니다.',
-            style: TextStyle(
-              fontSize: 14,
-              color: AppColors.textSec,
-              height: 1.6,
-            ),
-          ),
-          const Spacer(),
-          Row(
-            children: [
-              _infoChip(Icons.speed_rounded, '실시간 분석'),
-            ],
-          ),
-        ],
       ),
     );
   }
@@ -494,287 +511,354 @@ class _ScanPageState extends State<ScanPage> with TickerProviderStateMixin {
       decoration: BoxDecoration(
         color: AppColors.surfaceSub,
         borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: AppColors.border),
       ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon, size: 14, color: AppColors.accent),
-          const SizedBox(width: 6),
-          Text(label,
-            style: const TextStyle(
-              fontSize: 12,
-              fontWeight: FontWeight.w500,
-              color: AppColors.textSec,
+      child: Row(mainAxisSize: MainAxisSize.min, children: [
+        Icon(icon, size: 14, color: AppColors.accent),
+        const SizedBox(width: 6),
+        Text(label,
+          style: const TextStyle(
+            fontSize: 12, fontWeight: FontWeight.w600, color: AppColors.textSec,
+          ),
+        ),
+      ]),
+    );
+  }
+
+  // ── 로딩 화면 ─────────────────────────────────────────
+  Widget _buildLoadingLayer() {
+    return Container(
+      color: _ink.withOpacity(0.88),
+      child: Center(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          const SizedBox(
+            width: 64, height: 64,
+            child: CircularProgressIndicator(
+              color: Colors.white, strokeWidth: 3, strokeCap: StrokeCap.round,
             ),
           ),
-        ],
+          const SizedBox(height: 28),
+          const Text('QR 내용 분석 중...',
+            style: TextStyle(
+              color: Colors.white, fontSize: 20,
+              fontWeight: FontWeight.w700, letterSpacing: -0.4,
+            ),
+          ),
+          const SizedBox(height: 10),
+          Text('URL, 전화번호, 문자, Wi-Fi 정보를\n확인하고 있어요.',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: Colors.white.withOpacity(0.7), fontSize: 14, height: 1.5,
+            ),
+          ),
+        ]),
       ),
     );
   }
 
-  // ── 에러 뷰 ──────────────────────────────────────────
-  Widget _buildErrorView() {
-    return Padding(
-      padding: const EdgeInsets.all(24),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(children: [
-            const Icon(Icons.error_outline_rounded,
-                color: AppColors.danger, size: 22),
-            const SizedBox(width: 8),
-            const Text('오류 발생',
-              style: TextStyle(
-                fontSize: 18,
-                fontWeight: FontWeight.w700,
-                color: AppColors.danger,
-              ),
-            ),
-          ]),
-          const SizedBox(height: 12),
-          Text(_errorMessage ?? '',
-            style: const TextStyle(
-              fontSize: 13,
-              color: AppColors.textSec,
-              height: 1.6,
-            ),
-          ),
-          const Spacer(),
-          _rescanButton(),
-        ],
-      ),
-    );
-  }
-
-  // ── 결과 뷰 ──────────────────────────────────────────
-  Widget _buildResultView() {
+  // ── 결과 화면 ─────────────────────────────────────────
+  Widget _buildResultScreen() {
     final status    = _result?['status'] as String?;
-    final riskScore = _result?['risk_score'];
+    final rawScore  = _result?['risk_score'];
     final message   = _result?['message'] as String?;
     final reasons   = (_result?['reasons'] as List?) ?? [];
     final qrType    = _result?['qr_type'];
     final preview   = _result?['raw_content_preview'];
     final hasVtReport = _result?['vt_available'] == true &&
         _result?['vt_source'] == 'url_report';
-
+    final score = (rawScore is num ? rawScore.toDouble() : 0.0).clamp(0.0, 100.0);
     final color = _statusColor(status);
-    final bg    = _statusBg(status);
 
-    return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-
-          // 상태 배지 + 점수
-          Row(
-            children: [
+    return Container(
+      color: AppColors.bg,
+      child: Column(children: [
+        Expanded(
+          child: SingleChildScrollView(
+            child: Column(children: [
+              // 상단 요약 영역
               Container(
-                padding: const EdgeInsets.symmetric(
-                    horizontal: 14, vertical: 7),
+                width: double.infinity,
                 decoration: BoxDecoration(
-                  color: bg,
-                  borderRadius: BorderRadius.circular(20),
-                  border: Border.all(color: color.withOpacity(0.3)),
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [color.withOpacity(0.2), AppColors.bg],
+                  ),
                 ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(_statusIcon(status), size: 16, color: color),
-                    const SizedBox(width: 6),
-                    Text(_statusLabel(status),
-                      style: TextStyle(
-                        fontSize: 14,
-                        fontWeight: FontWeight.w700,
-                        color: color,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const Spacer(),
-              // 점수 카드
-              Container(
-                padding: const EdgeInsets.symmetric(
-                    horizontal: 14, vertical: 7),
-                decoration: BoxDecoration(
-                  color: AppColors.surfaceSub,
-                  borderRadius: BorderRadius.circular(20),
-                  border: Border.all(color: AppColors.border),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const Text('위험 점수',
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: AppColors.textHint,
-                        fontWeight: FontWeight.w500,
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Text('$riskScore',
-                      style: TextStyle(
-                        fontSize: 16,
-                        fontWeight: FontWeight.w700,
-                        color: color,
-                        fontFeatures: const [FontFeature.tabularFigures()],
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ),
-
-          const SizedBox(height: 14),
-
-          // QR 유형 + 내용 미리보기
-          if (qrType != null || preview != null || hasVtReport)
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.all(14),
-              decoration: BoxDecoration(
-                color: AppColors.surfaceSub,
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: AppColors.border),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  if (qrType != null) ...[
-                    Row(children: [
-                      const Icon(Icons.qr_code_rounded,
-                          size: 14, color: AppColors.textHint),
-                      const SizedBox(width: 6),
-                      Text(qrTypeLabel(qrType),
-                        style: const TextStyle(
-                          fontSize: 13,
-                          fontWeight: FontWeight.w600,
-                          color: AppColors.textSec,
-                        ),
-                      ),
-                    ]),
-                  ],
-                  if (qrType != null && preview != null)
-                    const SizedBox(height: 6),
-                  if (preview != null) ...[
-                    Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Icon(Icons.text_snippet_outlined,
-                            size: 14, color: AppColors.textHint),
-                        const SizedBox(width: 6),
-                        Expanded(
-                          child: Text('$preview',
-                            style: const TextStyle(
-                              fontSize: 12,
-                              color: AppColors.textHint,
-                              height: 1.5,
+                child: SafeArea(
+                  bottom: false,
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(24, 36, 24, 20),
+                    child: Column(children: [
+                      TweenAnimationBuilder<double>(
+                        tween: Tween(begin: 0, end: score / 100),
+                        duration: const Duration(milliseconds: 900),
+                        curve: Curves.easeOutCubic,
+                        builder: (_, v, __) => SizedBox(
+                          width: 156, height: 156,
+                          child: Stack(alignment: Alignment.center, children: [
+                            SizedBox.expand(
+                              child: CircularProgressIndicator(
+                                value: v, strokeWidth: 11,
+                                strokeCap: StrokeCap.round,
+                                backgroundColor: color.withOpacity(0.16),
+                                color: color,
+                              ),
                             ),
-                            maxLines: 2,
-                            overflow: TextOverflow.ellipsis,
-                          ),
+                            Column(mainAxisSize: MainAxisSize.min, children: [
+                              Text('${score.round()}',
+                                style: TextStyle(
+                                  fontSize: 48, fontWeight: FontWeight.w800,
+                                  color: color, height: 1,
+                                  fontFeatures: const [FontFeature.tabularFigures()],
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              const Text('위험 점수',
+                                style: TextStyle(
+                                  fontSize: 12, color: AppColors.textHint,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ]),
+                          ]),
                         ),
-                      ],
-                    ),
-                  ],
-                  if (hasVtReport && (qrType != null || preview != null))
-                    const SizedBox(height: 6),
-                  if (hasVtReport)
-                    const Row(
-                      children: [
-                        Icon(Icons.verified_user_outlined,
-                            size: 14, color: AppColors.textHint),
-                        SizedBox(width: 6),
-                        Text('VirusTotal 평판 검사 포함',
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: AppColors.textHint,
-                          ),
-                        ),
-                      ],
-                    ),
-                ],
-              ),
-            ),
-
-          const SizedBox(height: 12),
-
-          // 안내 메시지
-          if (message != null && message.isNotEmpty)
-            Text(message,
-              style: const TextStyle(
-                fontSize: 13,
-                color: AppColors.textSec,
-                height: 1.6,
-              ),
-            ),
-
-          // 판단 사유
-          if (reasons.isNotEmpty) ...[
-            const SizedBox(height: 12),
-            const Text('판단 사유',
-              style: TextStyle(
-                fontSize: 12,
-                fontWeight: FontWeight.w600,
-                color: AppColors.textHint,
-                letterSpacing: 0.5,
-              ),
-            ),
-            const SizedBox(height: 6),
-            ...reasons.map((r) => Padding(
-              padding: const EdgeInsets.only(bottom: 5),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text('→ ',
-                    style: TextStyle(
-                      fontSize: 13,
-                      color: AppColors.textHint,
-                    ),
-                  ),
-                  Expanded(
-                    child: Text('$r',
-                      style: const TextStyle(
-                        fontSize: 13,
-                        color: AppColors.textSec,
-                        height: 1.5,
                       ),
-                    ),
+                      const SizedBox(height: 22),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                        decoration: BoxDecoration(
+                          color: color, borderRadius: BorderRadius.circular(24),
+                        ),
+                        child: Row(mainAxisSize: MainAxisSize.min, children: [
+                          Icon(_statusIcon(status), size: 18, color: Colors.white),
+                          const SizedBox(width: 6),
+                          Text(_statusLabel(status),
+                            style: const TextStyle(
+                              fontSize: 16, fontWeight: FontWeight.w800, color: Colors.white,
+                            ),
+                          ),
+                        ]),
+                      ),
+                      if (message != null && message.isNotEmpty) ...[
+                        const SizedBox(height: 14),
+                        Text(message,
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                            fontSize: 15, color: AppColors.textPrim,
+                            fontWeight: FontWeight.w600, height: 1.5,
+                          ),
+                        ),
+                      ],
+                    ]),
                   ),
-                ],
+                ),
               ),
-            )),
-          ],
 
-          const SizedBox(height: 16),
-          _rescanButton(),
-        ],
-      ),
+              // 스캔 정보 카드
+              if (qrType != null || preview != null)
+                _card(
+                  title: '스캔 정보',
+                  icon: Icons.qr_code_2_rounded,
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    if (qrType != null) _infoRow('유형', qrTypeLabel(qrType)),
+                    if (preview != null) _infoRow('내용', '$preview'),
+                    if (hasVtReport)
+                      const Padding(
+                        padding: EdgeInsets.only(top: 4),
+                        child: Row(children: [
+                          Icon(Icons.verified_user_outlined,
+                              size: 14, color: AppColors.textHint),
+                          SizedBox(width: 6),
+                          Text('VirusTotal 평판 검사 포함',
+                            style: TextStyle(fontSize: 12, color: AppColors.textHint),
+                          ),
+                        ]),
+                      ),
+                  ]),
+                ),
+
+              // 판단 사유 카드
+              if (reasons.isNotEmpty)
+                _card(
+                  title: '판단 사유',
+                  icon: Icons.fact_check_outlined,
+                  child: Column(
+                    children: reasons.map((r) => Padding(
+                      padding: const EdgeInsets.only(bottom: 10),
+                      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        Padding(
+                          padding: const EdgeInsets.only(top: 6, right: 10),
+                          child: Container(
+                            width: 7, height: 7,
+                            decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+                          ),
+                        ),
+                        Expanded(
+                          child: Text('$r',
+                            style: const TextStyle(
+                              fontSize: 14, color: AppColors.textSec, height: 1.5,
+                            ),
+                          ),
+                        ),
+                      ]),
+                    )).toList(),
+                  ),
+                ),
+              const SizedBox(height: 16),
+            ]),
+          ),
+        ),
+        _bottomAction(),
+      ]),
     );
   }
 
-  // ── 다시 스캔 버튼 ────────────────────────────────────
+  Widget _card({required String title, required IconData icon, required Widget child}) {
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.fromLTRB(20, 0, 20, 12),
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: AppColors.border),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Icon(icon, size: 18, color: AppColors.accent),
+          const SizedBox(width: 8),
+          Text(title,
+            style: const TextStyle(
+              fontSize: 15, fontWeight: FontWeight.w700, color: AppColors.textPrim,
+            ),
+          ),
+        ]),
+        const SizedBox(height: 14),
+        child,
+      ]),
+    );
+  }
+
+  Widget _infoRow(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        SizedBox(
+          width: 44,
+          child: Text(label,
+            style: const TextStyle(
+              fontSize: 13, color: AppColors.textHint, fontWeight: FontWeight.w600,
+            ),
+          ),
+        ),
+        Expanded(
+          child: Text(value,
+            maxLines: 3, overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              fontSize: 14, color: AppColors.textPrim,
+              fontWeight: FontWeight.w600, height: 1.5,
+            ),
+          ),
+        ),
+      ]),
+    );
+  }
+
+  // ── 오류 화면 ─────────────────────────────────────────
+  Widget _buildErrorScreen() {
+    return Container(
+      color: AppColors.bg,
+      child: Column(children: [
+        Expanded(
+          child: SafeArea(
+            bottom: false,
+            child: Center(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 32),
+                child: Column(mainAxisSize: MainAxisSize.min, children: [
+                  Container(
+                    width: 88, height: 88,
+                    decoration: const BoxDecoration(
+                      color: AppColors.dangerBg, shape: BoxShape.circle,
+                    ),
+                    child: const Icon(Icons.cloud_off_rounded,
+                        size: 40, color: AppColors.danger),
+                  ),
+                  const SizedBox(height: 24),
+                  const Text('분석 중 문제가 발생했습니다',
+                    style: TextStyle(
+                      fontSize: 20, fontWeight: FontWeight.w800,
+                      color: AppColors.textPrim, letterSpacing: -0.4,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Text(_errorMessage ?? '',
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      fontSize: 14, color: AppColors.textSec, height: 1.6,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  const Text('네트워크 연결을 확인한 뒤 다시 시도해 주세요.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 13, color: AppColors.textHint, height: 1.6),
+                  ),
+                ]),
+              ),
+            ),
+          ),
+        ),
+        _bottomAction(),
+      ]),
+    );
+  }
+
+  // ── 하단 고정 버튼 ────────────────────────────────────
+  Widget _bottomAction() {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(20, 12, 20, 12),
+      decoration: const BoxDecoration(
+        color: AppColors.surface,
+        border: Border(top: BorderSide(color: AppColors.border)),
+      ),
+      child: SafeArea(top: false, child: _rescanButton()),
+    );
+  }
+
   Widget _rescanButton() {
     return SizedBox(
       width: double.infinity,
-      height: 48,
+      height: 56,
       child: FilledButton.icon(
         onPressed: _resetScan,
-        icon: const Icon(Icons.qr_code_scanner_rounded, size: 18),
+        icon: const Icon(Icons.qr_code_scanner_rounded, size: 20),
         label: const Text('다시 스캔하기',
-          style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+          style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
         ),
         style: FilledButton.styleFrom(
-          backgroundColor: AppColors.accent,
+          backgroundColor: _ink,
           foregroundColor: Colors.white,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(12),
-          ),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
         ),
       ),
     );
   }
+}
+
+// 스캔 영역만 밝게 남기는 어두운 마스크
+class _ScanMaskPainter extends CustomPainter {
+  final Rect hole;
+  _ScanMaskPainter(this.hole);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final path = Path()
+      ..fillType = PathFillType.evenOdd
+      ..addRect(Offset.zero & size)
+      ..addRRect(RRect.fromRectAndRadius(hole, const Radius.circular(28)));
+    canvas.drawPath(path, Paint()..color = Colors.black.withOpacity(0.55));
+  }
+
+  @override
+  bool shouldRepaint(_ScanMaskPainter old) => old.hole != hole;
 }
