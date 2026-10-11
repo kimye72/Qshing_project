@@ -96,7 +96,69 @@ def _decode_repeatedly(value: str, max_rounds: int = 3) -> tuple[str, bool]:
     return decoded, changed
 
 
-def _is_ip_address(hostname: str) -> tuple[bool, bool]:
+def _parse_ipv4_number(part: str) -> int | None:
+    """WHATWG IPv4 number syntax, with bounded arithmetic (no DNS).
+
+    Values above 32 bits retain an overflow sentinel: they cannot be an IPv4
+    component. Still check every digit so malformed syntax is not accepted.
+    """
+    if not part:
+        return None
+    radix = 10
+    if part[:2].lower() == "0x":
+        part, radix = part[2:], 16
+    elif len(part) >= 2 and part.startswith("0"):
+        part, radix = part[1:], 8
+    if not part:
+        return 0
+    digits = "0123456789abcdef"[:radix]
+    value = 0
+    for digit in part.lower():
+        if digit not in digits:
+            return None
+        value = min(value * radix + digits.index(digit), 2 ** 32)
+    return value
+
+
+def _parse_whatwg_ipv4(hostname: str) -> ipaddress.IPv4Address | None:
+    """Parse an ASCII numeric host; distinguish ordinary domains from failure.
+
+    None means the host does not end in a number. ValueError means a numeric
+    host failed IPv4 syntax/range checks. This is the numeric portion of the
+    WHATWG special-host parser, not a complete URL/IDNA parser.
+    https://url.spec.whatwg.org/#concept-ipv4-parser
+    """
+    if not hostname or not hostname.isascii():
+        return None
+    parts = hostname.split(".")
+    # Only one trailing dot is tolerated. Do not strip leading/empty labels.
+    if len(parts) > 1 and parts[-1] == "":
+        parts.pop()
+    last = parts[-1]
+    if not (
+        re.fullmatch(r"[0-9]+", last)
+        or _parse_ipv4_number(last) is not None
+    ):
+        return None
+    if len(parts) > 4:
+        raise ValueError("Too many IPv4 components")
+    numbers = [_parse_ipv4_number(part) for part in parts]
+    if any(number is None for number in numbers):
+        raise ValueError("Invalid IPv4 component")
+    if any(number > 255 for number in numbers[:-1]):
+        raise ValueError("IPv4 component out of range")
+    if numbers[-1] >= 256 ** (5 - len(numbers)):
+        raise ValueError("Final IPv4 component out of range")
+    value = numbers[-1] + sum(
+        number * 256 ** (3 - index)
+        for index, number in enumerate(numbers[:-1])
+    )
+    return ipaddress.IPv4Address(value)
+
+
+def _is_ip_address(
+    hostname: str, *, allow_browser_ipv4: bool = True,
+) -> tuple[bool, bool]:
     """IP 주소 여부와 사설/내부 IP 여부를 반환합니다."""
     if not hostname:
         return False, False
@@ -105,7 +167,15 @@ def _is_ip_address(hostname: str) -> tuple[bool, bool]:
     try:
         ip = ipaddress.ip_address(cleaned)
     except ValueError:
-        return False, False
+        if not allow_browser_ipv4:
+            return False, False
+        try:
+            # Decode the parsed host only, once; never reinterpret URL fields.
+            ip = _parse_whatwg_ipv4(unquote(cleaned, errors="strict"))
+        except ValueError:
+            return False, False
+        if ip is None:
+            return False, False
 
     is_private_or_local = any(
         [
@@ -225,7 +295,10 @@ def _get_local_heuristic_score(url: str, domain: str, decoded_url: str) -> tuple
         flags["long_url"] = True
         reasons.append("URL 길이가 길어 실제 목적지를 확인하기 어렵습니다.")
 
-    is_ip, is_private_or_local = _is_ip_address(hostname)
+    is_ip, is_private_or_local = _is_ip_address(
+        parsed.hostname or domain,
+        allow_browser_ipv4=scheme in ALLOWED_SCHEMES,
+    )
     is_private_hostname = _looks_like_private_hostname(hostname)
     if is_ip:
         risk_score += 25

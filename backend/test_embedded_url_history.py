@@ -82,6 +82,33 @@ class EmbeddedUrlHistoryTests(unittest.TestCase):
         self.assertEqual(set(database._EMBEDDED_URL_FAILURE_FIELDS),
                          set(EmbeddedUrlFailure.model_fields))
 
+    def test_browser_ipv4_flags_and_exact_addresses_survive_parent_history(self):
+        with patch.object(scanner, "get_url_report", return_value={
+            "enabled": False, "available": False, "lookup_status": "disabled",
+        }):
+            for host, score, private in (
+                ("127.1", 85, True), ("2130706433", 85, True),
+                ("0x7f000001", 85, True), ("0300.0250.1.1", 85, True),
+                ("134744072", 35, False),
+            ):
+                url = f"https://{host}/배송?Token=AbC+E#부분"
+                body = "확인: " + url
+                for content in (body, "SMS:+821012345678?body=" + quote(body, safe="")):
+                    with self.subTest(content=content):
+                        before = self.table.put_count
+                        analysis, history = self.analyze_and_list(content)
+                        self.assertEqual(self.table.put_count, before + 1)
+                        self.assertEqual(history["embedded_url_results"], analysis["embedded_url_results"])
+                        child = history["embedded_url_results"][0]
+                        self.assertEqual(child["original_url"], url)
+                        self.assertEqual(child["analysis_url"], url)
+                        self.assertEqual(child["local_score"], score)
+                        self.assertEqual(child["ruleset_version"], "1.6")
+                        self.assertTrue(child["analysis_flags"]["ip_address_host"])
+                        self.assertIs(child["analysis_flags"]["private_or_local_host"], private)
+                        self.assertFalse(child["assumed_https"])
+                        self.assertEqual(history["embedded_url_policy_version"], "2.1")
+
     def test_unicode_port_and_encoded_values_survive_parent_history_round_trip(self):
         candidate = "Example.COM:8443/배송조회?Token=Ab%26Cd+E&next=배송#조각%23"
         body = "배송 확인: " + candidate
@@ -105,7 +132,7 @@ class EmbeddedUrlHistoryTests(unittest.TestCase):
                     self.assertEqual(child["analysis_url"], "https://example.com:8443/배송조회?Token=Ab%26Cd+E&next=배송#조각%23")
                     self.assertTrue(child["assumed_https"])
                     self.assertEqual(history["embedded_url_policy_version"], "2.1")
-                    self.assertEqual(child["ruleset_version"], "1.5")
+                    self.assertEqual(child["ruleset_version"], RULESET_VERSION)
 
     def test_official_domain_insertion_flag_survives_parent_history_and_json(self):
         body = "확인 https://kakaopay.com.evil.invalid naver.me.evil.invalid https://fakepaypal.invalid"
@@ -154,7 +181,7 @@ class EmbeddedUrlHistoryTests(unittest.TestCase):
                         ("https://" + inserted_host, True, 45),
                     ):
                         child = children[url]
-                        self.assertEqual(child["ruleset_version"], "1.5")
+                        self.assertEqual(child["ruleset_version"], RULESET_VERSION)
                         self.assertEqual(child["local_score"], score)
                         self.assertIs(child["analysis_flags"]["suspicious_brand_domain"], inserted)
                         self.assertIs(child["analysis_flags"]["official_domain_insertion"], inserted)
@@ -173,7 +200,7 @@ class EmbeddedUrlHistoryTests(unittest.TestCase):
                     self.assertEqual(listed.status_code, 200)
                     history = next(item for item in listed.json()["items"] if item["scan_id"] == response.json()["scan_id"])
                     self.assertEqual(history["local_score"], score)
-                    self.assertEqual(history["ruleset_version"], "1.5")
+                    self.assertEqual(history["ruleset_version"], RULESET_VERSION)
                     self.assertIs(history["analysis_flags"]["official_domain_insertion"], inserted)
                     self.assertEqual(history["embedded_url_results"], [])
 

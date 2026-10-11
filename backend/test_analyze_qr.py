@@ -420,7 +420,7 @@ class SchemelessEmbeddedUrlTests(unittest.TestCase):
                     self.assertEqual(child["analysis_url"], qr_analyzer.normalize_http_url("https://" + candidate))
                     self.assertEqual(child["url"], child["analysis_url"])
                     self.assertTrue(child["assumed_https"])
-                    self.assertEqual(child["ruleset_version"], "1.5")
+                    self.assertEqual(child["ruleset_version"], RULESET_VERSION)
                     self.assertEqual(result["embedded_url_policy_version"], "2.1")
                     self.assertTrue(result["embedded_url_analysis_complete"])
 

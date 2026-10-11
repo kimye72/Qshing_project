@@ -300,7 +300,7 @@ class OfficialCountryDomainTests(unittest.TestCase):
 
     def assert_official(self, result, score=10, status="safe"):
         self.assertEqual((result["final_score"], result["status"]), (score, status))
-        self.assertEqual(result["ruleset_version"], "1.5")
+        self.assertEqual(result["ruleset_version"], RULESET_VERSION)
         self.assertFalse(result["analysis_flags"]["suspicious_brand_domain"])
         self.assertFalse(result["analysis_flags"]["official_domain_insertion"])
         self.assertNotIn(self.INSERTION_REASON, result["reasons"])
@@ -325,7 +325,7 @@ class OfficialCountryDomainTests(unittest.TestCase):
         return cached
 
     def test_country_hosts_case_trailing_dot_and_children_drop_to_ten(self):
-        self.assertEqual(RULESET_VERSION, "1.5")
+        self.assertEqual(RULESET_VERSION, "1.6")
         for host in (
             "google.com.au", "apple.com.cn", "GOOGLE.COM.AU.", "APPLE.COM.CN.",
             "www.google.com.au", "www.apple.com.cn", "m.google.com.au", "m.apple.com.cn",
@@ -437,7 +437,7 @@ class OfficialCountryDomainTests(unittest.TestCase):
                             analyzer.assert_called_once_with(url)
                             self.assertEqual(result["revalidation_reason"], "ruleset_changed")
                             self.assertFalse(result["cache_hit"])
-                            self.assertEqual(self.write.call_args.args[1]["ruleset_version"], "1.5")
+                            self.assertEqual(self.write.call_args.args[1]["ruleset_version"], RULESET_VERSION)
                             self.assertEqual(cached, before)
                             if context == "direct":
                                 self.assertEqual(result["_history_event_type"], "ruleset_reclassified")
@@ -445,7 +445,7 @@ class OfficialCountryDomainTests(unittest.TestCase):
                             else:
                                 self.assertNotIn("_history_should_save", result)
 
-    def test_15_cache_reuse_keeps_request_specific_https_metadata(self):
+    def test_current_cache_reuse_keeps_request_specific_https_metadata(self):
         with patch.object(url_cache, "URL_CACHE_ENABLED", True), TestClient(main.app) as client:
             for url in self.URLS:
                 current = scanner.analyze_url(url)
@@ -494,7 +494,7 @@ class OfficialCountryDomainTests(unittest.TestCase):
                 parent = response.json()
                 self.assertFalse(parent["embedded_url_analysis_complete"])
                 self.assertEqual(parent["final_score"], max(parent["text_score"], 30))
-                self.assertEqual(parent["embedded_url_results"][0]["ruleset_version"], "1.5")
+                self.assertEqual(parent["embedded_url_results"][0]["ruleset_version"], RULESET_VERSION)
                 self.assertEqual(parent["embedded_url_failures"][0]["error_code"], "EMBEDDED_URL_ANALYSIS_FAILED")
                 self.assertTrue(parent["embedded_url_failures"][0]["assumed_https"])
                 self.assertEqual(cached, before)

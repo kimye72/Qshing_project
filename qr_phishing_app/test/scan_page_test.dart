@@ -513,6 +513,56 @@ void main() {
   );
 
   testWidgets(
+    'ruleset 1.6 internal IPv4 results block direct and child launch targets',
+    (tester) async {
+      await mountPage(tester, client, launcher: launcher);
+      for (final host in [
+        '127.1',
+        '2130706433',
+        '0x7f000001',
+        '0300.0250.1.1',
+      ]) {
+        final address = 'https://$host/';
+        final dangerousFields = {
+          'status': 'danger',
+          'risk_score': 85,
+          'final_score': 85,
+          'local_score': 85,
+          'ruleset_version': '1.6',
+          'analysis_flags': {
+            'ip_address_host': true,
+            'private_or_local_host': true,
+          },
+          'reasons': ['localhost 또는 사설/내부망 주소로 보이는 호스트입니다.'],
+        };
+        for (final embedded in [false, true]) {
+          final json = embedded
+              ? withEmbeddedUrls([
+                  embeddedResponse(url: address)..addAll(dangerousFields),
+                ])
+              : (analysisResponse()..['url'] = address);
+          json.addAll(dangerousFields);
+          await analyze(tester, embedded ? '확인: $address' : address, json);
+          final button = find.byKey(
+            ValueKey(embedded ? 'open-embedded-0' : 'open-direct-url'),
+          );
+          await tester.ensureVisible(button);
+          expect(tester.widget<OutlinedButton>(button).onPressed, isNull);
+          expect(find.text('위험 판정으로 링크 열기를 제한했습니다.'), findsOneWidget);
+          await tester.tap(button);
+          await frames(tester);
+          expect(find.byType(AlertDialog), findsNothing);
+          expect(launcher.addresses, isEmpty);
+          // Waiting has a continuous frame pulse, so advance bounded frames.
+          await tester.tap(find.byKey(const Key('rescan-button')));
+          await frames(tester);
+        }
+      }
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
     'SMS action uses only session QR, preserves each form and never sends',
     (tester) async {
       await mountPage(tester, client, launcher: launcher);
