@@ -7,6 +7,7 @@ import 'package:http/http.dart' as http;
 import 'package:mobile_scanner/mobile_scanner.dart';
 
 import 'analysis_result.dart';
+import 'result_actions.dart';
 
 part 'analysis_result_view.dart';
 
@@ -87,11 +88,13 @@ class ScanPage extends StatefulWidget {
   const ScanPage({
     super.key,
     this.client,
+    this.launcher = const SystemExternalAppLauncher(),
     this.apiUrl = const String.fromEnvironment('API_URL', defaultValue: ''),
   });
 
   // An injected client stays owned by its caller. Production creates its own.
   final http.Client? client;
+  final ExternalAppLauncher launcher;
   final String apiUrl;
 
   @override
@@ -121,6 +124,12 @@ class _ScanPageState extends State<ScanPage>
 
   AnalysisResult? _result;
   String? _errorMessage;
+  // Only an explicit SMS/SMSTO payload is retained for this scan session.
+  // Never use server previews/masked fields, and never persist or log this.
+  String? _sessionSmsQr;
+  bool _actionBusy = false;
+  bool _launchInFlight = false;
+  DialogRoute<bool>? _actionDialog;
 
   late final AnimationController _pulseController;
   late final Animation<double> _pulseAnim;
@@ -277,6 +286,7 @@ class _ScanPageState extends State<ScanPage>
     setState(() {
       _cameraReady = false;
       _phase = _ScanPhase.error;
+      _sessionSmsQr = null;
       _errorMessage =
           error is MobileScannerException &&
               error.errorCode == MobileScannerErrorCode.permissionDenied
@@ -311,6 +321,10 @@ class _ScanPageState extends State<ScanPage>
         _cameraReady = false;
         _result = null;
         _errorMessage = null;
+        final lower = content.trim().toLowerCase();
+        _sessionSmsQr = lower.startsWith('sms:') || lower.startsWith('smsto:')
+            ? content
+            : null;
       });
       unawaited(_analyzeQRContent(content, generation));
       break;
@@ -383,6 +397,7 @@ class _ScanPageState extends State<ScanPage>
     setState(() {
       _errorMessage = message;
       _phase = _ScanPhase.error;
+      _sessionSmsQr = null;
     });
   }
 
@@ -396,11 +411,14 @@ class _ScanPageState extends State<ScanPage>
     }
 
     _requestGeneration++;
+    _dismissActionDialog();
     setState(() {
       _result = null;
       _errorMessage = null;
       _phase = _ScanPhase.scanning;
       _cameraReady = false;
+      _sessionSmsQr = null;
+      _actionBusy = false;
     });
     _syncPulse();
     _scheduleCameraSync();
@@ -410,6 +428,19 @@ class _ScanPageState extends State<ScanPage>
   void dispose() {
     _disposed = true;
     _requestGeneration++;
+    _sessionSmsQr = null;
+    // Navigation can be locked while a page is being removed. Invalidate now
+    // and remove any surviving modal on the next frame, without using context.
+    final dialog = _actionDialog;
+    _actionDialog = null;
+    if (dialog != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        final navigator = dialog.navigator;
+        if (dialog.isActive && navigator != null && navigator.mounted) {
+          navigator.removeRoute(dialog);
+        }
+      });
+    }
     WidgetsBinding.instance.removeObserver(this);
     unawaited(_barcodeSubscription?.cancel());
     if (_ownsClient) _client.close();
@@ -783,7 +814,200 @@ class _ScanPageState extends State<ScanPage>
     );
   }
 
-  Widget _buildResultView() => AnalysisResultView(result: _result!);
+  Widget _buildResultView() {
+    final generation = _requestGeneration;
+    final result = _result!;
+    final draft = result.qrType == 'sms' && _sessionSmsQr != null
+        ? parseSmsDraft(_sessionSmsQr!)
+        : null;
+    return AnalysisResultView(
+      result: result,
+      actionsBusy: _actionBusy || _launchInFlight,
+      smsAvailable: draft != null,
+      onOpenLink: (target) => _openLink(target, generation),
+      onComposeSms: () {
+        if (draft != null) _composeSms(draft, generation);
+      },
+    );
+  }
+
+  bool _isActionSession(int generation) =>
+      !_disposed &&
+      mounted &&
+      generation == _requestGeneration &&
+      _phase == _ScanPhase.result;
+
+  void _dismissActionDialog() {
+    final dialog = _actionDialog;
+    _actionDialog = null;
+    if (dialog != null && dialog.isActive) {
+      dialog.navigator?.removeRoute(dialog);
+    }
+  }
+
+  void _actionMessage(String message) {
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  List<Widget> _actionWarnings({String? linkStatus}) => [
+    if (_result!.status == 'warning' || linkStatus == 'warning')
+      const Text('주의 판정입니다. 내용을 충분히 확인한 뒤 진행하세요.'),
+    if (_result!.isIncomplete) ...[
+      const Text('일부 링크의 분석을 완료하지 못했습니다.'),
+      if ((_result!.skippedEmbeddedUrlCount ?? 0) > 0)
+        Text('분석 개수 제한으로 ${_result!.skippedEmbeddedUrlCount}개 링크를 검사하지 못했습니다.'),
+    ],
+    const Text('분석 결과는 실제 안전성을 보장하지 않습니다.'),
+  ];
+
+  void _openLink(LinkActionTarget target, int generation) {
+    if (!_isActionSession(generation)) return;
+    if (_result!.status == 'danger' || target.status == 'danger') {
+      _actionMessage('위험 판정으로 링크 열기를 제한했습니다.');
+      return;
+    }
+    if (!isLaunchableWebAddress(target.address)) return;
+    unawaited(
+      _confirmAndLaunch(
+        generation: generation,
+        title: '링크 열기 확인',
+        confirmLabel: '링크 열기',
+        address: target.address,
+        content: [
+          const Text('실행할 주소'),
+          SelectableText(target.address, key: const Key('action-link-address')),
+          if (target.assumedHttps) ...[
+            for (final original in target.originalCandidates)
+              SelectableText('원본 후보: $original'),
+            const Text('분석을 위해 HTTPS를 가정했습니다. 실제 HTTPS 지원 여부는 확인하지 않았습니다.'),
+          ],
+          ..._actionWarnings(linkStatus: target.status),
+          Text(reputationNoticeText(target.reputation)),
+        ],
+      ),
+    );
+  }
+
+  void _composeSms(SmsDraft draft, int generation) {
+    if (!_isActionSession(generation)) return;
+    if (_result!.status == 'danger') {
+      _actionMessage('위험 판정으로 문자 작성을 제한했습니다.');
+      return;
+    }
+    unawaited(
+      _confirmAndLaunch(
+        generation: generation,
+        title: '문자 작성 확인',
+        confirmLabel: '문자 앱 열기',
+        address: draft.address,
+        content: [
+          const Text('수신 번호'),
+          SelectableText(
+            draft.recipient,
+            key: const Key('action-sms-recipient'),
+          ),
+          const Text('본문'),
+          SelectableText(
+            draft.body.isEmpty ? '(본문 없음)' : draft.body,
+            key: const Key('action-sms-body'),
+          ),
+          const Text('문자 앱의 작성 화면을 엽니다. 전송은 문자 앱에서 직접 진행하세요.'),
+          ..._actionWarnings(),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _confirmAndLaunch({
+    required int generation,
+    required String title,
+    required String confirmLabel,
+    required String address,
+    required List<Widget> content,
+  }) async {
+    if (!_isActionSession(generation) ||
+        !_foreground ||
+        _actionBusy ||
+        _launchInFlight) {
+      return;
+    }
+    setState(() {
+      _actionBusy = true;
+    });
+    var launched = false;
+    var answered = false;
+    late final DialogRoute<bool> dialog;
+    dialog = DialogRoute<bool>(
+      context: context,
+      builder: (dialogContext) {
+        void finish(bool confirmed) {
+          if (answered || !dialog.isCurrent || !_isActionSession(generation)) {
+            return;
+          }
+          answered = true;
+          Navigator.of(dialogContext).pop(confirmed);
+        }
+
+        return AlertDialog(
+          key: const Key('result-action-dialog'),
+          title: Text(title),
+          scrollable: true,
+          content: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              for (final item in content)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: item,
+                ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              key: const Key('action-cancel'),
+              onPressed: () => finish(false),
+              child: const Text('취소'),
+            ),
+            TextButton(
+              key: const Key('action-confirm'),
+              onPressed: () => finish(true),
+              child: Text(confirmLabel),
+            ),
+          ],
+        );
+      },
+    );
+    _actionDialog = dialog;
+    try {
+      final confirmed = await Navigator.of(context).push(dialog);
+      if (_actionDialog == dialog) _actionDialog = null;
+      if (!_isActionSession(generation) || !_foreground) return;
+      if (confirmed != true) {
+        _actionMessage('실행을 취소했습니다.');
+        return;
+      }
+      // No asynchronous gap between the final session check and OS dispatch.
+      launched = true;
+      _launchInFlight = true;
+      final opened = await widget.launcher.open(address);
+      if (!opened && _isActionSession(generation)) {
+        _actionMessage('외부 앱을 열지 못했습니다. 잠시 후 다시 시도해주세요.');
+      }
+    } catch (_) {
+      if (_isActionSession(generation)) {
+        _actionMessage('외부 앱을 열지 못했습니다. 잠시 후 다시 시도해주세요.');
+      }
+    } finally {
+      if (!_disposed && mounted) {
+        setState(() {
+          if (_isActionSession(generation)) _actionBusy = false;
+          if (launched) _launchInFlight = false;
+        });
+      }
+    }
+  }
 
   Widget _buildProgressView() => Center(
     child: SingleChildScrollView(

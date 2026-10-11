@@ -7,6 +7,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:qr_phishing_app/main.dart';
+import 'package:qr_phishing_app/result_actions.dart';
 
 import 'fixtures/analysis_responses.dart';
 
@@ -131,6 +132,20 @@ class FakeAnalysisClient extends http.BaseClient {
   }
 }
 
+class FakeExternalLauncher implements ExternalAppLauncher {
+  final addresses = <String>[];
+  Completer<bool>? gate;
+  bool succeeds = true;
+  bool throwsError = false;
+
+  @override
+  Future<bool> open(String address) async {
+    addresses.add(address);
+    if (throwsError) throw StateError('secret platform exception');
+    return gate == null ? succeeds : await gate!.future;
+  }
+}
+
 // A pulsing scanning frame intentionally animates continuously. Advance a few
 // frames instead of pumpAndSettle, which would wait forever in scanning state.
 Future<void> frames(WidgetTester tester) async {
@@ -167,6 +182,7 @@ Future<void> mountPage(
   double scale = 1,
   bool disableAnimations = false,
   EdgeInsets safePadding = EdgeInsets.zero,
+  ExternalAppLauncher launcher = const SystemExternalAppLauncher(),
   String endpoint = 'https://analysis.invalid/analyze-qr',
 }) async {
   await tester.pumpWidget(
@@ -180,7 +196,7 @@ Future<void> mountPage(
         ),
         child: child!,
       ),
-      home: ScanPage(client: client, apiUrl: endpoint),
+      home: ScanPage(client: client, apiUrl: endpoint, launcher: launcher),
     ),
   );
   await frames(tester);
@@ -189,6 +205,7 @@ Future<void> mountPage(
 void main() {
   late FakeCamera camera;
   late FakeAnalysisClient client;
+  late FakeExternalLauncher launcher;
   late MobileScannerPlatform originalPlatform;
 
   setUp(() {
@@ -197,6 +214,7 @@ void main() {
     originalPlatform = MobileScannerPlatform.instance;
     camera = FakeCamera();
     client = FakeAnalysisClient();
+    launcher = FakeExternalLauncher();
     MobileScannerPlatform.instance = camera;
   });
 
@@ -204,6 +222,501 @@ void main() {
     await camera.close();
     MobileScannerPlatform.instance = originalPlatform;
   });
+
+  Future<void> analyze(
+    WidgetTester tester,
+    String content,
+    Map<String, dynamic> json,
+  ) async {
+    camera.detect(content);
+    await frames(tester);
+    client.complete(client.requests.length - 1, json: json);
+    await frames(tester);
+  }
+
+  Future<void> press(WidgetTester tester, String key) async {
+    final button = find.byKey(ValueKey(key));
+    await tester.ensureVisible(button);
+    await frames(tester);
+    await tester.tap(button);
+    await tester.pumpAndSettle();
+  }
+
+  testWidgets(
+    'unsupported addresses and incomplete child metadata have no action',
+    (tester) async {
+      await mountPage(tester, client, launcher: launcher);
+      for (final address in [
+        'javascript:alert(1)',
+        'data:text/plain,hello',
+        'file:///tmp/a',
+        'intent://example.invalid',
+        'https://user@example.invalid',
+        'https://@example.invalid',
+        '',
+      ]) {
+        await analyze(tester, 'QR', analysisResponse()..['url'] = address);
+        expect(find.byKey(const Key('open-direct-url')), findsNothing);
+        await tester.tap(find.byKey(const Key('rescan-button')));
+        await frames(tester);
+      }
+      await analyze(
+        tester,
+        '본문',
+        withEmbeddedUrls([
+          embeddedResponse()..addAll({'risk_score': null, 'final_score': null}),
+          embeddedResponse()..['status'] = null,
+          embeddedResponse()..['analysis_url'] = 'https://user@child.invalid',
+        ]),
+      );
+      for (var index = 0; index < 3; index++) {
+        expect(find.byKey(ValueKey('open-embedded-$index')), findsNothing);
+      }
+      expect(launcher.addresses, isEmpty);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'direct link confirms exact address, cancels, and blocks repeated clicks',
+    (tester) async {
+      await mountPage(tester, client, launcher: launcher);
+      const address =
+          'https://example.invalid/a/../AbC?Token=Ab%2fCd&x=%26%3D%3F%2B';
+      await analyze(
+        tester,
+        address,
+        analysisResponse()..addAll({
+          'url': address,
+          'status': 'warning',
+          'risk_score': 55,
+          'embedded_url_analysis_complete': false,
+        }),
+      );
+      expect(launcher.addresses, isEmpty);
+      await press(tester, 'open-direct-url');
+      expect(find.text('실행할 주소'), findsOneWidget);
+      expect(find.byKey(const Key('action-link-address')), findsOneWidget);
+      expect(find.text(address), findsWidgets);
+      expect(find.textContaining('주의 판정입니다.'), findsOneWidget);
+      expect(find.textContaining('일부 링크의 분석을 완료하지 못했습니다.'), findsNWidgets(2));
+      expect(find.textContaining('외부 평판 정보 없음'), findsNWidgets(2));
+      expect(launcher.addresses, isEmpty);
+      await press(tester, 'action-cancel');
+      expect(find.text('실행을 취소했습니다.'), findsOneWidget);
+      expect(find.byType(AnalysisResultView), findsOneWidget);
+      final button = tester.widget<OutlinedButton>(
+        find.byKey(const Key('open-direct-url')),
+      );
+      button.onPressed!();
+      button.onPressed!();
+      await tester.pumpAndSettle();
+      expect(find.byType(AlertDialog), findsOneWidget);
+      final confirm = tester
+          .widget<TextButton>(find.byKey(const Key('action-confirm')))
+          .onPressed!;
+      confirm();
+      confirm();
+      await tester.pumpAndSettle();
+      expect(launcher.addresses, [address]);
+      await background(tester);
+      await resume(tester);
+      expect(find.byType(AnalysisResultView), findsOneWidget);
+      expect(find.text('Qshing'), findsOneWidget);
+      expect(camera.starts, 1);
+      expect(find.byType(MobileScanner), findsNothing);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'each embedded link confirms its own target, assumptions and reputation',
+    (tester) async {
+      await mountPage(tester, client, launcher: launcher);
+      final json =
+          withEmbeddedUrls([
+            embeddedResponse(url: 'https://assumed.invalid/Path?A=B')..addAll({
+              ...requestedReport(),
+              'assumed_https': true,
+              'original_candidates': ['assumed.invalid/Path?A=B'],
+            }),
+            embeddedResponse(url: 'https://past.invalid/Other')
+              ..addAll(historicalReport()),
+            embeddedResponse(url: 'https://blocked.invalid')
+              ..addAll({'status': 'danger', 'final_score': 85}),
+          ])..addAll({
+            'url': 'https://parent.invalid',
+            'status': 'warning',
+            'risk_score': 55,
+            'embedded_url_analysis_complete': false,
+            'analysis_flags': {'embedded_url_skipped_count': 2},
+            'embedded_url_failures': [
+              {
+                'analysis_url': 'https://failed.invalid',
+                'error_code': 'EMBEDDED_URL_ANALYSIS_FAILED',
+              },
+            ],
+          });
+      await analyze(tester, '문자 안 링크', json);
+      expect(find.byKey(const Key('open-direct-url')), findsNothing);
+      await press(tester, 'open-embedded-0');
+      final dialog = find.byType(AlertDialog);
+      expect(
+        find.descendant(
+          of: dialog,
+          matching: find.text('https://assumed.invalid/Path?A=B'),
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.descendant(
+          of: dialog,
+          matching: find.textContaining('실제 HTTPS 지원 여부는 확인하지 않았습니다.'),
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.descendant(
+          of: dialog,
+          matching: find.textContaining('이번 요청에서 외부 리포트를 조회했습니다.'),
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.descendant(of: dialog, matching: find.textContaining('과거 악성 탐지')),
+        findsNothing,
+      );
+      expect(
+        find.descendant(
+          of: dialog,
+          matching: find.textContaining('분석 개수 제한으로 2개'),
+        ),
+        findsOneWidget,
+      );
+      await press(tester, 'action-confirm');
+      await press(tester, 'open-embedded-1');
+      expect(
+        find.descendant(
+          of: find.byType(AlertDialog),
+          matching: find.textContaining('점수에 과거 평판 정보를 사용'),
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.descendant(
+          of: find.byType(AlertDialog),
+          matching: find.textContaining('과거 악성 탐지 3건'),
+        ),
+        findsOneWidget,
+      );
+      await press(tester, 'action-confirm');
+      expect(launcher.addresses, [
+        'https://assumed.invalid/Path?A=B',
+        'https://past.invalid/Other',
+      ]);
+      expect(
+        tester
+            .widget<OutlinedButton>(find.byKey(const Key('open-embedded-2')))
+            .onPressed,
+        isNull,
+      );
+      expect(find.text('위험 판정으로 링크 열기를 제한했습니다.'), findsOneWidget);
+      final failure = find.byKey(const ValueKey('embedded-failure-0'));
+      expect(
+        find.descendant(of: failure, matching: find.byType(OutlinedButton)),
+        findsNothing,
+      );
+    },
+  );
+
+  testWidgets(
+    'danger parent blocks direct and all embedded links and SMS composing',
+    (tester) async {
+      await mountPage(tester, client, launcher: launcher);
+      for (final type in ['url', 'text_with_url', 'sms']) {
+        final json = type == 'text_with_url'
+            ? withEmbeddedUrls([embeddedResponse()])
+            : analysisResponse(qrType: type);
+        json.addAll({'status': 'danger', 'risk_score': 85});
+        await analyze(tester, 'SMSTO:01012345678:본문', json);
+        final key = type == 'url'
+            ? 'open-direct-url'
+            : type == 'sms'
+            ? 'compose-sms'
+            : 'open-embedded-0';
+        expect(
+          tester.widget<OutlinedButton>(find.byKey(ValueKey(key))).onPressed,
+          isNull,
+        );
+        expect(
+          find.text(
+            type == 'sms' ? '위험 판정으로 문자 작성을 제한했습니다.' : '위험 판정으로 링크 열기를 제한했습니다.',
+          ),
+          findsOneWidget,
+        );
+        await tester.tap(find.byKey(const Key('rescan-button')));
+        await frames(tester);
+      }
+      expect(launcher.addresses, isEmpty);
+    },
+  );
+
+  testWidgets(
+    'SMS action uses only session QR, preserves each form and never sends',
+    (tester) async {
+      await mountPage(tester, client, launcher: launcher);
+      const body = '한글 & ? = + https://example.invalid/?A=B&C=D+E';
+      final cases = [
+        'SMS:%2B821012345678?subject=제목:콜론&body=${Uri.encodeComponent(body)}',
+        'SMSTO:+821012345678:${Uri.encodeComponent(body)}',
+        'sms:+821012345678:$body',
+        'sms:+821012345678?body=&subject=제목:콜론',
+      ];
+      for (var index = 0; index < cases.length; index++) {
+        await analyze(
+          tester,
+          cases[index],
+          analysisResponse(qrType: 'sms')..addAll({
+            'status': 'warning',
+            'risk_score': 55,
+            'raw_content_preview': 'SMS:010****9999:마스킹된 미리보기',
+            'structured_content': {
+              'sms_recipient_masked': '010****9999',
+              'sms_body_preview': '미리보기',
+            },
+            'embedded_url_analysis_complete': false,
+          }),
+        );
+        expect(launcher.addresses, hasLength(index));
+        await press(tester, 'compose-sms');
+        expect(find.text('+821012345678'), findsOneWidget);
+        expect(find.text(index == 3 ? '(본문 없음)' : body), findsOneWidget);
+        expect(find.textContaining('전송은 문자 앱에서 직접 진행'), findsOneWidget);
+        expect(find.textContaining('주의 판정입니다.'), findsOneWidget);
+        expect(
+          find.descendant(
+            of: find.byType(AlertDialog),
+            matching: find.textContaining('일부 링크의 분석'),
+          ),
+          findsOneWidget,
+        );
+        await press(tester, 'action-confirm');
+        final address = launcher.addresses.last;
+        expect(address.startsWith('sms:+821012345678?body='), isTrue);
+        expect(
+          Uri.decodeComponent(address.split('?body=')[1]),
+          index == 3 ? '' : body,
+        );
+        await tester.tap(find.byKey(const Key('rescan-button')));
+        await frames(tester);
+      }
+      await analyze(
+        tester,
+        'sms:010****9999:본문',
+        analysisResponse(qrType: 'sms'),
+      );
+      expect(find.byKey(const Key('compose-sms')), findsNothing);
+      expect(find.textContaining('수신 번호 또는 문자 형식을 확인할 수 없어'), findsOneWidget);
+      expect(launcher.addresses, hasLength(4));
+    },
+  );
+
+  testWidgets(
+    'rescan dismisses old confirmation and stale callbacks cannot launch',
+    (tester) async {
+      await mountPage(tester, client, launcher: launcher);
+      await analyze(
+        tester,
+        'sms:01012345678:old',
+        analysisResponse(qrType: 'sms'),
+      );
+      final oldView = tester.widget<AnalysisResultView>(
+        find.byType(AnalysisResultView),
+      );
+      final reset = tester
+          .widget<FilledButton>(find.byKey(const Key('rescan-button')))
+          .onPressed!;
+      await press(tester, 'compose-sms');
+      final oldConfirm = tester
+          .widget<TextButton>(find.byKey(const Key('action-confirm')))
+          .onPressed!;
+      reset();
+      oldConfirm();
+      await frames(tester);
+      expect(find.byType(AlertDialog), findsNothing);
+      expect(launcher.addresses, isEmpty);
+      await analyze(
+        tester,
+        'sms:01098765432:new',
+        analysisResponse(qrType: 'sms'),
+      );
+      oldView.onComposeSms!();
+      await frames(tester);
+      expect(find.byType(AlertDialog), findsNothing);
+      await press(tester, 'compose-sms');
+      expect(find.text('01098765432'), findsOneWidget);
+      expect(find.text('old'), findsNothing);
+      await press(tester, 'action-confirm');
+      expect(launcher.addresses, ['sms:01098765432?body=new']);
+      expect(camera.starts, 2);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'pending OS launch cannot duplicate or affect a new scan on late failure',
+    (tester) async {
+      launcher.gate = Completer<bool>();
+      await mountPage(tester, client, launcher: launcher);
+      await analyze(tester, 'QR', analysisResponse());
+      final oldView = tester.widget<AnalysisResultView>(
+        find.byType(AnalysisResultView),
+      );
+      await press(tester, 'open-direct-url');
+      await press(tester, 'action-confirm');
+      oldView.onOpenLink!(LinkActionTarget.direct(oldView.result)!);
+      await frames(tester);
+      expect(launcher.addresses, hasLength(1));
+      await tester.tap(find.byKey(const Key('rescan-button')));
+      await frames(tester);
+      await analyze(
+        tester,
+        'QR2',
+        analysisResponse()..['url'] = 'https://new.invalid/Path',
+      );
+      expect(
+        tester
+            .widget<OutlinedButton>(find.byKey(const Key('open-direct-url')))
+            .onPressed,
+        isNull,
+      );
+      launcher.gate!.complete(false);
+      await frames(tester);
+      expect(find.textContaining('외부 앱을 열지 못했습니다.'), findsNothing);
+      expect(
+        tester
+            .widget<OutlinedButton>(find.byKey(const Key('open-direct-url')))
+            .onPressed,
+        isNotNull,
+      );
+      oldView.onOpenLink!(LinkActionTarget.direct(oldView.result)!);
+      await frames(tester);
+      expect(find.byType(AlertDialog), findsNothing);
+      expect(launcher.addresses, hasLength(1));
+      expect(find.text('https://new.invalid/Path'), findsWidgets);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'launcher false and exception retain result and show only public recovery',
+    (tester) async {
+      await mountPage(tester, client, launcher: launcher);
+      await analyze(tester, 'QR', analysisResponse());
+      for (final throwsError in [false, true]) {
+        launcher.succeeds = false;
+        launcher.throwsError = throwsError;
+        await press(tester, 'open-direct-url');
+        await press(tester, 'action-confirm');
+        expect(find.textContaining('외부 앱을 열지 못했습니다.'), findsOneWidget);
+        expect(find.textContaining('secret'), findsNothing);
+        expect(find.byType(AnalysisResultView), findsOneWidget);
+        expect(
+          find.byKey(const Key('rescan-button')).hitTestable(),
+          findsOneWidget,
+        );
+      }
+    },
+  );
+
+  testWidgets(
+    'dispose removes confirmation and ignores a pending launch completion',
+    (tester) async {
+      await mountPage(tester, client, launcher: launcher);
+      await analyze(tester, 'QR', analysisResponse());
+      await press(tester, 'open-direct-url');
+      final confirm = tester
+          .widget<TextButton>(find.byKey(const Key('action-confirm')))
+          .onPressed!;
+      await tester.pumpWidget(const SizedBox.shrink());
+      confirm();
+      await frames(tester);
+      expect(launcher.addresses, isEmpty);
+      launcher.gate = Completer<bool>();
+      await mountPage(tester, client, launcher: launcher);
+      await analyze(tester, 'QR', analysisResponse());
+      await press(tester, 'open-direct-url');
+      await press(tester, 'action-confirm');
+      await tester.pumpWidget(const SizedBox.shrink());
+      launcher.gate!.complete(false);
+      await frames(tester);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'small 2x screen scrolls action confirmations and keeps bottom rescan reachable',
+    (tester) async {
+      tester.view.physicalSize = const Size(280, 568);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      await mountPage(tester, client, launcher: launcher, scale: 2);
+      final body = '한글 예약문자 & ? = + 긴 본문 ${'본문 ' * 80}'.trimRight();
+      final address =
+          'https://example.invalid/${'LongPath' * 40}?Token=${'AbC' * 80}';
+      await analyze(
+        tester,
+        'SMSTO:01012345678:$body',
+        withEmbeddedUrls([
+          embeddedResponse(url: address)..addAll(historicalReport()),
+        ])..addAll({
+          'qr_type': 'sms',
+          'status': 'warning',
+          'risk_score': 55,
+          'embedded_url_analysis_complete': false,
+        }),
+      );
+      await press(tester, 'compose-sms');
+      expect(
+        find.byKey(const Key('action-confirm')).hitTestable(),
+        findsOneWidget,
+      );
+      expect(find.text(body), findsOneWidget);
+      expect(tester.takeException(), isNull);
+      await press(tester, 'action-cancel');
+      expect(
+        find.byKey(const Key('rescan-button')).hitTestable(),
+        findsOneWidget,
+      );
+      // Advance the fake clock past transient cancellation feedback. It may
+      // overlay the last body card, but never the fixed rescan action.
+      await tester.pump(const Duration(seconds: 5));
+      await tester.pumpAndSettle();
+      await press(tester, 'open-embedded-0');
+      expect(
+        find.byKey(const Key('action-confirm')).hitTestable(),
+        findsOneWidget,
+      );
+      expect(find.text(address), findsWidgets);
+      expect(tester.takeException(), isNull);
+      await press(tester, 'action-confirm');
+      expect(launcher.addresses, [address]);
+      expect(
+        find.byKey(const Key('rescan-button')).hitTestable(),
+        findsOneWidget,
+      );
+      await tester.tap(find.byKey(const Key('rescan-button')));
+      await frames(tester);
+      camera.detect('SMSTO:01012345678:$body');
+      await frames(tester);
+      expect(client.requests, hasLength(2));
+      client.complete(1, json: analysisResponse(qrType: 'text'));
+      await frames(tester);
+      expect(find.byKey(const Key('compose-sms')), findsNothing);
+      expect(tester.takeException(), isNull);
+    },
+  );
 
   for (final size in [
     const Size(280, 360),

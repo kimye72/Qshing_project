@@ -2,8 +2,19 @@ part of 'main.dart';
 
 class AnalysisResultView extends StatelessWidget {
   final AnalysisResult result;
+  final ValueChanged<LinkActionTarget>? onOpenLink;
+  final VoidCallback? onComposeSms;
+  final bool smsAvailable;
+  final bool actionsBusy;
 
-  const AnalysisResultView({super.key, required this.result});
+  const AnalysisResultView({
+    super.key,
+    required this.result,
+    this.onOpenLink,
+    this.onComposeSms,
+    this.smsAvailable = false,
+    this.actionsBusy = false,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -36,6 +47,9 @@ class AnalysisResultView extends StatelessWidget {
               const SizedBox(height: 8),
               _address('분석 주소', result.url!),
             ],
+            if (onOpenLink != null)
+              _linkAction(LinkActionTarget.direct(result), 'open-direct-url'),
+            if (result.qrType == 'sms' && onComposeSms != null) _smsAction(),
           ]),
           const SizedBox(height: 12),
           Text(result.displayMessage, style: _bodyStyle),
@@ -120,7 +134,66 @@ class AnalysisResultView extends StatelessWidget {
     _reasonList(item.reasons),
     const SizedBox(height: 12),
     _reputation(item.reputation),
+    if (onOpenLink != null)
+      _linkAction(LinkActionTarget.embedded(item), 'open-embedded-$index'),
   ], key: ValueKey('embedded-result-$index'));
+
+  Widget _linkAction(LinkActionTarget? target, String key) {
+    if (target == null) return const SizedBox.shrink();
+    final blocked = result.status == 'danger' || target.status == 'danger';
+    return Padding(
+      padding: const EdgeInsets.only(top: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (blocked)
+            _iconText(
+              Icons.block_rounded,
+              '위험 판정으로 링크 열기를 제한했습니다.',
+              color: AppColors.danger,
+            ),
+          OutlinedButton.icon(
+            key: ValueKey(key),
+            onPressed: blocked || actionsBusy
+                ? null
+                : () => onOpenLink!(target),
+            icon: const Icon(Icons.open_in_new_rounded),
+            label: const Text('링크 열기'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _smsAction() {
+    final blocked = result.status == 'danger';
+    return Padding(
+      padding: const EdgeInsets.only(top: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (blocked)
+            _iconText(
+              Icons.block_rounded,
+              '위험 판정으로 문자 작성을 제한했습니다.',
+              color: AppColors.danger,
+            )
+          else if (!smsAvailable)
+            _iconText(
+              Icons.info_outline_rounded,
+              '수신 번호 또는 문자 형식을 확인할 수 없어 문자 작성을 제한했습니다.',
+            ),
+          if (smsAvailable)
+            OutlinedButton.icon(
+              key: const Key('compose-sms'),
+              onPressed: blocked || actionsBusy ? null : onComposeSms,
+              icon: const Icon(Icons.sms_outlined),
+              label: const Text('문자 작성'),
+            ),
+        ],
+      ),
+    );
+  }
 
   Widget _failedResult(EmbeddedUrlFailure item, int index) => _card([
     _iconText(Icons.error_outline_rounded, '링크 분석 실패'),
@@ -159,53 +232,8 @@ class AnalysisResultView extends StatelessWidget {
     ],
   );
 
-  Widget _reputation(UrlReputation reputation) {
-    final title = switch (reputation.availability) {
-      ReputationAvailability.available => '외부 평판 정보 있음',
-      ReputationAvailability.unavailable => '외부 평판 정보 없음',
-      ReputationAvailability.unknown => '조회 상태 확인 불가',
-    };
-    final lookupMessage = switch (reputation.lookupStatus) {
-      ReputationLookupStatus.available => '외부 리포트 조회 완료',
-      ReputationLookupStatus.cached => '저장된 리포트를 재사용했습니다.',
-      ReputationLookupStatus.lookupFailed => '외부 평판을 조회하지 못했습니다.',
-      ReputationLookupStatus.timeout => '외부 평판 조회 시간이 초과되었습니다.',
-      ReputationLookupStatus.budgetExhausted => '분석 시간 안에 외부 평판을 확인하지 못했습니다.',
-      ReputationLookupStatus.rateLimited => '외부 평판 조회가 일시적으로 제한되었습니다.',
-      ReputationLookupStatus.reportMissing => '이 주소의 외부 평판 리포트가 없습니다.',
-      ReputationLookupStatus.submitted => '분석 요청이 접수되었지만 리포트는 아직 확인되지 않았습니다.',
-      ReputationLookupStatus.disabled => '외부 평판 조회를 사용하지 않았습니다.',
-      ReputationLookupStatus.unknown => '평판 조회 상태를 확인할 수 없습니다.',
-    };
-    final sourceMessage = switch (reputation.source) {
-      ReputationSource.requestedReport =>
-        '이번 요청에서 외부 리포트를 조회했습니다. 리포트의 분석 시각은 조회 시각과 다를 수 있습니다.',
-      ReputationSource.storedReport => '저장된 평판 정보이며 최신 상태와 다를 수 있습니다.',
-      ReputationSource.historicalReport =>
-        '이번 외부 평판 조회는 완료되지 않았습니다. 점수에 과거 평판 정보를 사용했으며 최신 상태와 다를 수 있습니다.',
-      ReputationSource.unknown => '평판 정보의 출처를 확인할 수 없습니다.',
-    };
-    final historical = reputation.historicalReputationUsed;
-    final lines = [
-      lookupMessage,
-      sourceMessage,
-      if (historical && reputation.source != ReputationSource.historicalReport)
-        '점수에 과거 평판 정보를 사용했습니다. 이번 조회의 완료 여부는 조회 상태 안내를 확인하세요.',
-      if (reputation.availability == ReputationAvailability.available ||
-          historical) ...[
-        reputation.malicious == null
-            ? '${historical ? '과거 ' : ''}악성 탐지 수 확인 불가'
-            : '${historical ? '과거 ' : ''}악성 탐지 ${reputation.malicious}건',
-        reputation.suspicious == null
-            ? '${historical ? '과거 ' : ''}의심 탐지 수 확인 불가'
-            : '${historical ? '과거 ' : ''}의심 탐지 ${reputation.suspicious}건',
-      ],
-      if (reputation.availability == ReputationAvailability.unavailable)
-        '현재 확인한 정보만으로 평가한 결과입니다.',
-      '외부 평판 정보는 실제 안전성을 보장하지 않습니다.',
-    ];
-    return _notice(Icons.info_outline_rounded, '$title\n${lines.join('\n')}');
-  }
+  Widget _reputation(UrlReputation reputation) =>
+      _notice(Icons.info_outline_rounded, reputationNoticeText(reputation));
 
   Color _statusColor(String? status) => switch (status) {
     'safe' => AppColors.safe,
