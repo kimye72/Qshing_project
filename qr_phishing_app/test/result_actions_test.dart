@@ -24,6 +24,7 @@ void main() {
       );
       final addresses = [
         'https://example.invalid/a/../AbC?Token=Ab%2fCd&x=%26%3D%3F%2B',
+        'https://example.com:8443/배송조회?Token=Ab%26Cd+E#조각%23',
         const SmsDraft('+821012345678', '한글 & ? = +').address,
       ];
       for (final address in addresses) {
@@ -34,7 +35,7 @@ void main() {
         expect(arguments['useWebView'], isFalse);
         expect(arguments['useSafariVC'], isFalse);
       }
-      expect(calls, hasLength(2));
+      expect(calls, hasLength(addresses.length));
     },
   );
 
@@ -44,6 +45,7 @@ void main() {
       'http://example.invalid/a/../B?Case=A+B#Part',
       'HTTPS://EXAMPLE.INVALID/Path',
       'https://[::1]:8443/Path',
+      'https://example.com:8443/배송조회?Token=Ab%26Cd+E#조각%23',
     ]) {
       expect(isLaunchableWebAddress(address), isTrue, reason: address);
       final result = AnalysisResult.fromJson(

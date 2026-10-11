@@ -430,6 +430,57 @@ void main() {
   );
 
   testWidgets(
+    'Unicode path and port candidates launch the complete child analysis address',
+    (tester) async {
+      const candidates = [
+        'example.com/배송조회?token=AbC',
+        'example.com/track?next=배송조회',
+        'example.com:8443/배송조회?Token=Ab%26Cd+E#조각%23',
+      ];
+      await mountPage(tester, client, launcher: launcher);
+      await analyze(
+        tester,
+        '배송 확인: ${candidates.join(' ')}',
+        withEmbeddedUrls([
+          for (final candidate in candidates)
+            embeddedResponse(url: 'https://$candidate')..addAll({
+              // Neither a parent's representative URL nor a truncated legacy
+              // url field is an execution target when analysis_url is present.
+              'url': 'https://example.com/',
+              'original_url': candidate,
+              'original_candidates': [candidate],
+              'assumed_https': true,
+            }),
+        ])..['url'] = 'https://parent.invalid/',
+      );
+      for (var index = 0; index < candidates.length; index++) {
+        await press(tester, 'open-embedded-$index');
+        final dialog = find.byType(AlertDialog);
+        expect(
+          find.descendant(
+            of: dialog,
+            matching: find.text('https://${candidates[index]}'),
+          ),
+          findsOneWidget,
+        );
+        expect(
+          find.descendant(
+            of: dialog,
+            matching: find.textContaining('HTTPS를 가정'),
+          ),
+          findsWidgets,
+        );
+        await press(tester, 'action-confirm');
+        expect(launcher.addresses.last, 'https://${candidates[index]}');
+      }
+      expect(launcher.addresses, [
+        for (final candidate in candidates) 'https://$candidate',
+      ]);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
     'danger parent blocks direct and all embedded links and SMS composing',
     (tester) async {
       await mountPage(tester, client, launcher: launcher);

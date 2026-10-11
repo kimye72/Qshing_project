@@ -101,11 +101,11 @@ URL 규칙 버전은 **`RULESET_VERSION=1.5`**입니다. HTTP, IP 호스트, 길
 
 일반 텍스트는 포함 링크를 분석합니다. `SMS`, SMS colon-message, `SMSTO`, `mailto`는 **원시 필드 경계를 먼저 분리한 뒤 필요한 값을 디코딩하여 본문 링크만 분석**합니다. 수신자·메일 주소·제목·Wi-Fi SSID의 도메인을 본문 링크로 취급하지 않으며, 인코딩된 `&`, `=`, `?`로 바깥 필드 경계를 다시 나누지 않습니다.
 
-검증된 `bit.ly/3abcde` 같은 스킴 없는 후보에는 `https://`를 가정해 기존 URL 분석·캐시 경로를 적용합니다. **실제 HTTPS 지원이나 도착지·안전성을 확인한 것이 아닙니다.** 스킴 생략 자체에는 점수를 가산하지 않으며 이메일 주소·일반 파일명·검증 제외 문자열·다른 URI 스킴을 임의로 HTTPS 주소로 바꾸지 않습니다.
+검증된 `bit.ly/3abcde` 같은 스킴 없는 후보에는 `https://`를 가정해 기존 URL 분석·캐시 경로를 적용합니다. **실제 HTTPS 지원이나 도착지·안전성을 확인한 것이 아닙니다.** 연결 정책 2.1은 한글 경로·쿼리·fragment와 1–65535 범위의 포트를 보존하며, 잘못된 포트에서 도메인만 잘라 분석하지 않습니다. 이미 보이는 URL의 기존 퍼센트 인코딩과 `&`, `=`, `+`도 보존합니다. 공백 없이 경로에 붙은 조사·설명은 URL과 구분할 수 없으므로 링크 뒤 설명은 공백으로 분리하세요. 스킴 생략 자체에는 점수를 가산하지 않으며 이메일 주소·일반 파일명·검증 제외 문자열·다른 URI 스킴을 임의로 HTTPS 주소로 바꾸지 않습니다.
 
 명시적 HTTP/HTTPS 링크를 먼저 선택하고 후보를 합칩니다. 스킴·호스트를 소문자화한 분석 주소로 중복 제거하되 경로·쿼리 대소문자는 보존하며, HTTP와 HTTPS는 별개입니다. **실패한 시도를 포함해 최대 3개 URL을 순차 분석**합니다. 원본은 `original_url`, `original_candidates`, 분석 주소는 `analysis_url`, 가정 여부는 `assumed_https`로 반환하며, 이 메타데이터는 캐시와 분리해 요청별로 붙입니다. 기존 `extracted_urls`는 명시적 URL, `extracted_url_candidates`는 원본 후보의 의미를 유지합니다. 구조형 QR의 공개 추출 목록과 본문 분석 대상은 다를 수 있습니다.
 
-포함 URL을 분석한 QR의 최종 점수는 **`max(parent_score, embedded_url_max_score)`**입니다. 일부 링크가 실패해도 부모 점수와 성공한 링크 결과를 보존합니다. `embedded_url_failures`는 공개 오류 코드와 대상 정보를 제공하며, 실패 또는 개수 제한 제외가 있으면 `embedded_url_analysis_complete=false`입니다. 실패 개수와 제한 제외 개수는 `analysis_flags`에서 구분합니다. 포함 URL 연결 정책 **2.0**과 비URL 점수 규칙 **2.0**은 URL 규칙 버전과 별도입니다. 상세 계약은 [포함 URL 정책](backend/EMBEDDED_URL_POLICY.md)에 있습니다.
+포함 URL을 분석한 QR의 최종 점수는 **`max(parent_score, embedded_url_max_score)`**입니다. 일부 링크가 실패해도 부모 점수와 성공한 링크 결과를 보존합니다. `embedded_url_failures`는 공개 오류 코드와 대상 정보를 제공하며, 실패 또는 개수 제한 제외가 있으면 `embedded_url_analysis_complete=false`입니다. 실패 개수와 제한 제외 개수는 `analysis_flags`에서 구분합니다. 포함 URL 연결 정책 **2.1**과 비URL 점수 규칙 **2.0**은 URL 규칙 버전과 별도입니다. 상세 계약은 [포함 URL 정책](backend/EMBEDDED_URL_POLICY.md)에 있습니다.
 
 | 최종 점수 | API status | 앱 표시 |
 | ---: | --- | --- |

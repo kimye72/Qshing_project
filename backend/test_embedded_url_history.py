@@ -82,6 +82,31 @@ class EmbeddedUrlHistoryTests(unittest.TestCase):
         self.assertEqual(set(database._EMBEDDED_URL_FAILURE_FIELDS),
                          set(EmbeddedUrlFailure.model_fields))
 
+    def test_unicode_port_and_encoded_values_survive_parent_history_round_trip(self):
+        candidate = "Example.COM:8443/배송조회?Token=Ab%26Cd+E&next=배송#조각%23"
+        body = "배송 확인: " + candidate
+        with patch.object(scanner, "get_url_report", return_value={
+            "enabled": False, "available": False, "lookup_status": "disabled",
+        }):
+            for content in (
+                body, "SMS:+821012345678:" + body,
+                "SMSTO:+821012345678:" + body,
+                "sms:+821012345678?body=" + quote(body, safe=""),
+                "mailto:user@recipient.invalid?subject=ignored.invalid&body=" + quote(body, safe=""),
+            ):
+                with self.subTest(content=content):
+                    before = self.table.put_count
+                    analysis, history = self.analyze_and_list(content)
+                    self.assertEqual(self.table.put_count, before + 1)
+                    self.assertEqual(history["embedded_url_results"], analysis["embedded_url_results"])
+                    child = history["embedded_url_results"][0]
+                    self.assertEqual(child["original_url"], candidate)
+                    self.assertEqual(child["original_candidates"], [candidate])
+                    self.assertEqual(child["analysis_url"], "https://example.com:8443/배송조회?Token=Ab%26Cd+E&next=배송#조각%23")
+                    self.assertTrue(child["assumed_https"])
+                    self.assertEqual(history["embedded_url_policy_version"], "2.1")
+                    self.assertEqual(child["ruleset_version"], "1.5")
+
     def test_official_domain_insertion_flag_survives_parent_history_and_json(self):
         body = "확인 https://kakaopay.com.evil.invalid naver.me.evil.invalid https://fakepaypal.invalid"
         with patch.object(scanner, "get_url_report", return_value={

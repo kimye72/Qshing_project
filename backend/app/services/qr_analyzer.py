@@ -32,9 +32,15 @@ URL_CANDIDATE_PATTERN = re.compile(
     rf"(?P<candidate>"
     rf"(?P<domain>(?:{DOMAIN_LABEL_PATTERN}\.)+"
     rf"(?:[A-Za-z]{{2,63}}|xn--[A-Za-z0-9-]{{2,59}}))"
-    rf"(?P<suffix>[/?#][A-Za-z0-9._~:/?#\[\]@!$&()*+,;=%-]*)?"
+    # Keep authority, path, query and fragment separate. URL values may
+    # contain Unicode; whitespace/quotes, rather than ASCII, end the token.
+    # Consume even an invalid port so it cannot become a bare-domain match.
+    rf"(?P<port>:[^/\s<>'\"?#]*)?"
+    rf"(?P<path>/[^\s<>'\"?#]*)?"
+    rf"(?P<query>\?[^\s<>'\"#]*)?"
+    rf"(?P<fragment>\#[^\s<>'\"]*)?"
     rf")"
-    rf"(?![A-Za-z0-9-])",
+    rf"(?![A-Za-z0-9_:%-]|\.[A-Za-z0-9_-])",
     re.IGNORECASE,
 )
 
@@ -330,13 +336,16 @@ def _redact_wifi_password(content: str) -> str:
     return content[:5] + ";".join(redacted_fields)
 
 
-def _first_query_value(query: str, key: str) -> str | None:
+def _first_query_value(
+    query: str, key: str, *, preserve_url_encoding: bool = False,
+) -> str | None:
     values = parse_qs(query, keep_blank_values=True).get(key)
     if not values:
         return None
     # parse_qs already performs one decoding pass. Decode at most two more
     # times after the query boundary has been established.
-    return decode_repeatedly(values[0], max_rounds=2)
+    decode = _decode_link_body if preserve_url_encoding else decode_repeatedly
+    return decode(values[0], max_rounds=2)
 
 
 def _parse_phone_content(content: str, qr_type: str) -> dict | None:
@@ -351,18 +360,23 @@ def _parse_phone_content(content: str, qr_type: str) -> dict | None:
     return {"phone_number_masked": masked} if masked else None
 
 
-def _parse_sms_payload(content: str) -> tuple[str, str | None] | None:
+def _parse_sms_payload(
+    content: str, *, preserve_url_encoding: bool = False,
+) -> tuple[str, str | None] | None:
     """Parse query SMS, SMSTO and the SMS colon-message compatibility form."""
     lower = content.lower()
+    decode_body = _decode_link_body if preserve_url_encoding else decode_repeatedly
 
     if lower.startswith("smsto:"):
         payload = content[6:]
         recipient, separator, body_value = payload.partition(":")
-        body = decode_repeatedly(body_value) if separator else None
+        body = decode_body(body_value) if separator else None
     elif lower.startswith("sms:"):
         payload = content[4:]
         recipient, separator, query = payload.partition("?")
-        body = _first_query_value(query, "body") if separator else None
+        body = _first_query_value(
+            query, "body", preserve_url_encoding=preserve_url_encoding,
+        ) if separator else None
         # An explicit empty query body still takes precedence. For the
         # colon-message compatibility form, split before decoding values.
         # A colon inside a query value is not the colon-message delimiter.
@@ -370,7 +384,7 @@ def _parse_sms_payload(content: str) -> tuple[str, str | None] | None:
         # colon-message body may still contain its own unencoded URL query.
         if body is None and ":" in recipient:
             recipient, _, body_value = payload.partition(":")
-            body = decode_repeatedly(body_value)
+            body = decode_body(body_value)
     else:
         return None
 
@@ -396,7 +410,9 @@ def _parse_sms_content(content: str) -> dict | None:
     return metadata or None
 
 
-def _parse_email_payload(content: str) -> tuple[str, str | None, str | None] | None:
+def _parse_email_payload(
+    content: str, *, preserve_url_encoding: bool = False,
+) -> tuple[str, str | None, str | None] | None:
     if not content.lower().startswith("mailto:"):
         return None
 
@@ -405,7 +421,9 @@ def _parse_email_payload(content: str) -> tuple[str, str | None, str | None] | N
     return (
         decode_repeatedly(address.split(",", 1)[0].strip()),
         _first_query_value(query, "subject") if separator else None,
-        _first_query_value(query, "body") if separator else None,
+        _first_query_value(
+            query, "body", preserve_url_encoding=preserve_url_encoding,
+        ) if separator else None,
     )
 
 
@@ -556,10 +574,10 @@ def _extract_structured_body(content: str, qr_type: str) -> str:
     """Establish field boundaries before decoding an SMS or mail body."""
     try:
         if qr_type == "sms":
-            parsed_sms = _parse_sms_payload(content)
+            parsed_sms = _parse_sms_payload(content, preserve_url_encoding=True)
             body = parsed_sms[1] if parsed_sms is not None else None
         elif qr_type == "email":
-            parsed_email = _parse_email_payload(content)
+            parsed_email = _parse_email_payload(content, preserve_url_encoding=True)
             body = parsed_email[2] if parsed_email is not None else None
         else:
             return ""
@@ -608,6 +626,47 @@ def _is_valid_domain_candidate(domain: str, *, has_suffix: bool) -> bool:
     return True
 
 
+def _is_valid_candidate_port(port: str | None) -> bool:
+    if port is None:
+        return True
+    digits = port[1:]
+    significant_digits = digits.lstrip("0") or "0"
+    return bool(
+        re.fullmatch(r"[0-9]+", digits)
+        and len(significant_digits) <= 5
+        and 1 <= int(significant_digits) <= 65535
+    )
+
+
+def _decode_link_body(value: str, max_rounds: int = 3) -> str:
+    """Decode body wrappers without decoding an already visible URL's values.
+
+    Query field splitting/its first decoding pass happens before this helper.
+    Encoded legacy URLs can still become visible over at most three passes.
+    Once their URL structure is visible, existing percent escapes stay intact.
+    """
+    for _ in range(max_rounds):
+        spans = [match.span() for match in URL_PATTERN.finditer(value)]
+        spans.extend(
+            match.span() for match in URL_CANDIDATE_PATTERN.finditer(value)
+            if any(match.group(name) is not None for name in ("port", "path", "query", "fragment"))
+        )
+        # Overlapping explicit/candidate spans must be decoded only once.
+        pieces: list[str] = []
+        end = 0
+        for start, stop in sorted(spans):
+            if start < end:
+                continue
+            pieces.extend((unquote(value[end:start]), value[start:stop]))
+            end = stop
+        pieces.append(unquote(value[end:]))
+        decoded = "".join(pieces)
+        if decoded == value:
+            break
+        value = decoded
+    return value
+
+
 def extract_url_candidates(
     content: str, *, preserve_structured_fields: bool = False,
 ) -> list[str]:
@@ -622,6 +681,16 @@ def extract_url_candidates(
             and match.group(0).lower().startswith(tuple(ACTION_SCHEMES))
         ):
             continue
+        # A dotted domain followed by a valid numeric port resembles a URI
+        # scheme lexically. Exempt only that complete authority/token shape;
+        # custom:, ftp:, javascript:, etc. remain excluded.
+        port_candidate = URL_CANDIDATE_PATTERN.fullmatch(match.group(0))
+        if (
+            port_candidate is not None and port_candidate.group("port") is not None
+            and _is_valid_candidate_port(port_candidate.group("port"))
+            and _is_valid_domain_candidate(port_candidate.group("domain"), has_suffix=True)
+        ):
+            continue
         excluded_spans.append(match.span())
 
     candidates: list[str] = []
@@ -631,13 +700,16 @@ def extract_url_candidates(
         if any(_spans_overlap(match.span(), span) for span in excluded_spans):
             continue
 
-        candidate = match.group("candidate").rstrip(".,;:!?)]}")
+        candidate = match.group("candidate").rstrip(".,;!)]}")
         if not candidate:
             continue
 
         domain = match.group("domain")
         has_suffix = len(candidate) > len(domain)
-        if not _is_valid_domain_candidate(domain, has_suffix=has_suffix):
+        if (
+            not _is_valid_domain_candidate(domain, has_suffix=has_suffix)
+            or not _is_valid_candidate_port(match.group("port"))
+        ):
             continue
 
         dedupe_key = domain.lower() + candidate[len(domain):]
@@ -716,9 +788,14 @@ def analyze_non_url_qr(content: str) -> dict:
         else decoded_content
     )
 
-    extracted_urls = extract_urls(public_analysis_content)
+    # Local/social checks retain their existing decoded input. Addresses used
+    # for navigation and URL analysis must preserve visible URL percent escapes.
+    extraction_content = _decode_link_body(original_content)
+    if lower_decoded.startswith("wifi:"):
+        extraction_content = _redact_wifi_password(extraction_content)
+    extracted_urls = extract_urls(extraction_content)
     all_url_candidates = extract_url_candidates(
-        public_analysis_content, preserve_structured_fields=True,
+        extraction_content, preserve_structured_fields=True,
     )
     extracted_url_candidates = all_url_candidates[:MAX_URL_CANDIDATES]
     qr_type = detect_qr_type(

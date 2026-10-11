@@ -2,6 +2,7 @@ import copy
 import unittest
 from decimal import Decimal
 from unittest.mock import Mock, patch
+from urllib.parse import quote
 
 from botocore.exceptions import ClientError
 from fastapi import HTTPException
@@ -394,6 +395,99 @@ class SchemelessEmbeddedUrlTests(unittest.TestCase):
     def analyze(self, content):
         return main.analyze_qr(QRAnalyzeRequest(content=content))
 
+    def test_unicode_and_ports_preserve_full_address_in_real_api(self):
+        for candidate in (
+            "example.com/배송조회?token=AbC",
+            "example.com/track?next=배송조회",
+            "Example.COM:8443/배송조회?Token=AbC&next=Home+배송#조각",
+            "Example.COM/Ab%2fCd?Next=%26%3D%3F%2B&Token=AbC+배송#Part%23조각",
+        ):
+            body = "배송 확인: " + candidate
+            for content in (
+                body, "SMS:+821012345678:" + body,
+                "SMSTO:+821012345678:" + body,
+                "sms:+821012345678?subject=ignored.invalid&body=" + quote(body, safe=""),
+                "mailto:user@recipient.invalid?subject=ignored.invalid&body=" + quote(body, safe=""),
+            ):
+                with self.subTest(content=content):
+                    response = TestClient(main.app).post("/analyze-qr", json={"content": content})
+                    self.assertEqual(response.status_code, 200)
+                    result = response.json()
+                    self.assertEqual(result["embedded_url_count"], 1)
+                    child = result["embedded_url_results"][0]
+                    self.assertEqual(child["original_url"], candidate)
+                    self.assertEqual(child["original_candidates"], [candidate])
+                    self.assertEqual(child["analysis_url"], qr_analyzer.normalize_http_url("https://" + candidate))
+                    self.assertEqual(child["url"], child["analysis_url"])
+                    self.assertTrue(child["assumed_https"])
+                    self.assertEqual(child["ruleset_version"], "1.5")
+                    self.assertEqual(result["embedded_url_policy_version"], "2.1")
+                    self.assertTrue(result["embedded_url_analysis_complete"])
+
+    def test_port_validation_never_falls_back_to_domain_only(self):
+        for port in ("1", "443", "8443", "65535", "000443"):
+            candidate = f"example.com:{port}/배송?Token=AbC#부분"
+            with self.subTest(port=port):
+                self.assertEqual(qr_analyzer.extract_url_candidates(candidate), [candidate])
+                result = self.analyze("확인: " + candidate)
+                self.assertEqual(result["embedded_url_results"][0]["analysis_url"], "https://" + candidate)
+                expected = 10 if int(port) == 443 else 20
+                self.assertEqual(result["embedded_url_results"][0]["local_score"], expected)
+        for port in ("", "0", "65536", "999999999999999999", "-1", "+443", "abc", "8443bad", "８４４３", "8443:443"):
+            for body in (f"example.com:{port}", f"example.com:{port}/배송?Token=AbC"):
+                for content in (body, "SMSTO:+821012345678:" + body):
+                    with self.subTest(content=content), patch("app.main.analyze_url_with_cache") as cache:
+                        result = self.analyze(content)
+                        self.assertEqual(result["embedded_url_count"], 0)
+                        cache.assert_not_called()
+
+    def test_port_support_keeps_other_uri_and_non_body_exclusions(self):
+        for body in (
+            "ftp://example.com:8443/배송", "custom:example.com:8443/배송",
+            "file://example.com:8443/배송", "javascript:example.com:8443/배송",
+            "user@example.com report.pdf",
+        ):
+            for content in (body, "SMSTO:+821012345678:" + body):
+                with self.subTest(content=content), patch("app.main.analyze_url_with_cache") as cache:
+                    self.analyze(content)
+                    cache.assert_not_called()
+        for content in (
+            "sms:recipient.invalid:8443?body=hello&subject=example.com:8443/배송",
+            "mailto:user@recipient.invalid?subject=" + quote("example.com:8443/배송", safe="") + "&body=hello",
+            "WIFI:T:WPA;S:example.com:8443/배송;P:example.com:8443;;",
+        ):
+            with self.subTest(content=content), patch("app.main.analyze_url_with_cache") as cache:
+                self.analyze(content)
+                cache.assert_not_called()
+
+    def test_unicode_encoded_port_addresses_keep_dedupe_limit_and_failure_targets(self):
+        candidate = "Example.COM:8443/배송?Token=Ab%26Cd+E#부분"
+        address = "https://example.com:8443/배송?Token=Ab%26Cd+E#부분"
+        body = f"확인: {address} {candidate} example.com:8443/배송?Token=ab%26Cd+E#부분 failed.invalid:8443/배송 fourth.invalid/배송"
+        def analyze(url, **_):
+            if url.startswith("https://failed.invalid"):
+                raise RuntimeError("private exception")
+            return make_url_result(url)
+        with patch("app.main.analyze_url_with_cache", side_effect=analyze) as cache:
+            result = TestClient(main.app).post("/analyze-qr", json={"content": body}).json()
+        self.assertEqual(cache.call_count, 3)
+        self.assertEqual(cache.call_args_list[0].args[0], address)
+        self.assertEqual(result["embedded_url_count"], 4)
+        self.assertEqual(result["analyzed_embedded_url_count"], 2)
+        self.assertEqual(result["analysis_flags"]["embedded_url_skipped_count"], 1)
+        self.assertFalse(result["embedded_url_analysis_complete"])
+        self.assertEqual(result["embedded_url_results"][0]["original_candidates"], [candidate])
+        self.assertEqual(result["embedded_url_failures"][0]["analysis_url"], "https://failed.invalid:8443/배송")
+        self.assertNotIn("private exception", str(result))
+
+    def test_direct_url_and_embedded_explicit_url_keep_unicode_and_percent_escapes(self):
+        address = "https://example.com:8443/배송?Token=Ab%26Cd+Ef&Next=%3F#조각%23"
+        for content in (address, "확인: " + address, "SMSTO:+821012345678:" + address):
+            with self.subTest(content=content), patch("app.main.analyze_url_with_cache", side_effect=lambda url, **_: make_url_result(url)) as cache:
+                response = TestClient(main.app).post("/analyze-qr", json={"content": content})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(cache.call_args.args[0], address)
+
     def test_delivery_notice_uses_existing_shortener_score(self):
         result = self.analyze("택배 안내입니다. 확인: bit.ly/3abcde")
         self.assertEqual(result["text_score"], 0)
@@ -602,8 +696,8 @@ class SchemelessEmbeddedUrlTests(unittest.TestCase):
         self.assertNotIn(ASSUMED_HTTPS_REASON, cached["reasons"])
 
     def test_cached_explicit_and_assumed_requests_keep_separate_metadata(self):
-        url = "https://example.invalid/Path?Key=AbC"
-        candidate = "EXAMPLE.invalid/Path?Key=AbC"
+        url = "https://example.invalid:8443/배송?Key=Ab%26Cd+E#부분"
+        candidate = "EXAMPLE.invalid:8443/배송?Key=Ab%26Cd+E#부분"
         cached = make_cache_item(url, checked_at=950)
         original_reasons = list(cached["reasons"])
         original_flags = dict(cached["analysis_flags"])
@@ -1365,7 +1459,7 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
                 result = analyze_non_url_qr(content)
                 self.assertEqual(result["extracted_url_candidates"], [expected])
 
-    def test_candidate_is_extracted_from_korean_text(self):
+    def test_korean_text_adjacent_to_path_remains_part_of_candidate(self):
         result = analyze_non_url_qr(
             "로그인은 example.co.kr/account에서 하세요"
         )
@@ -1373,7 +1467,7 @@ class AnalyzeQrRoutingTests(unittest.TestCase):
         self.assertEqual(result["qr_type"], "text_with_url")
         self.assertEqual(
             result["extracted_url_candidates"],
-            ["example.co.kr/account"],
+            ["example.co.kr/account에서"],
         )
 
     def test_http_url_is_not_duplicated_as_candidate(self):
