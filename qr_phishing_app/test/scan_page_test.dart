@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -619,6 +620,86 @@ void main() {
       expect(find.byKey(const Key('compose-sms')), findsNothing);
       expect(find.textContaining('수신 번호 또는 문자 형식을 확인할 수 없어'), findsOneWidget);
       expect(launcher.addresses, hasLength(4));
+    },
+  );
+
+  testWidgets(
+    'SMS confirmation and launcher preserve the backend analyzed URL body',
+    (tester) async {
+      tester.view.physicalSize = const Size(280, 568);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      await mountPage(tester, client, launcher: launcher, scale: 2);
+      final fixture =
+          jsonDecode(
+                File(
+                  'test/fixtures/sms_analysis_bodies.json',
+                ).readAsStringSync(),
+              )
+              as Map<String, dynamic>;
+      const names = {
+        'repro/smsto/wrapper-0',
+        'repro/colon/wrapper-0',
+        'repro/query/visible-scheme',
+        'repro/query/wrapper-1',
+        'repro/query/wrapper-3',
+        'reserved-nested/smsto/wrapper-2',
+        'unicode-port/colon/wrapper-0',
+        'unicode-port/query/wrapper-2',
+        'multiple-links/query/wrapper-1',
+        'outside-url-decoding',
+        'query-first-empty',
+      };
+      for (final item in fixture['cases'] as List) {
+        if (!names.contains(item['name'])) continue;
+        final urls = [
+          for (final url in item['urls'] as List)
+            embeddedResponse(url: url as String)..['ruleset_version'] = '1.6',
+          for (final candidate in item['candidates'] as List)
+            embeddedResponse(url: 'https://$candidate')..addAll({
+              'original_url': candidate,
+              'original_candidates': [candidate],
+              'assumed_https': true,
+              'ruleset_version': '1.6',
+            }),
+        ];
+        await analyze(
+          tester,
+          item['raw'] as String,
+          withEmbeddedUrls(urls)..addAll({
+            'qr_type': 'sms',
+            'embedded_url_policy_version': '2.1',
+            // A preview must never supply an executable message body.
+            'structured_content': {'sms_body_preview': '다른 미리보기'},
+          }),
+        );
+        final launches = launcher.addresses.length;
+        await press(tester, 'compose-sms');
+        final shownBody = tester
+            .widget<SelectableText>(find.byKey(const Key('action-sms-body')))
+            .data;
+        expect(
+          shownBody,
+          item['body'] == '' ? '(본문 없음)' : item['body'],
+          reason: item['name'] as String,
+        );
+        expect(launcher.addresses, hasLength(launches));
+        await press(tester, 'action-confirm');
+        expect(launcher.addresses, hasLength(launches + 1));
+        final address = launcher.addresses.last;
+        expect(address.startsWith('sms:01012340000?body='), isTrue);
+        expect(
+          Uri.decodeComponent(address.split('?body=')[1]),
+          item['body'],
+          reason: item['name'] as String,
+        );
+        expect(find.byType(AnalysisResultView), findsOneWidget);
+        await tester.tap(find.byKey(const Key('rescan-button')));
+        await frames(tester);
+      }
+      expect(launcher.addresses, hasLength(names.length));
+      expect(tester.takeException(), isNull);
     },
   );
 

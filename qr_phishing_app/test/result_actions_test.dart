@@ -1,3 +1,6 @@
+import 'dart:convert';
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter/services.dart';
 import 'package:qr_phishing_app/analysis_result.dart';
@@ -147,6 +150,41 @@ void main() {
       );
     },
   );
+
+  test('SMS drafts match backend analysis bodies and preserve URL escapes', () {
+    // Generated and checked against the real offline backend analysis body
+    // and extractors at the commit recorded in this fixture, not its preview.
+    final fixture =
+        jsonDecode(
+              File('test/fixtures/sms_analysis_bodies.json').readAsStringSync(),
+            )
+            as Map<String, dynamic>;
+    for (final item in fixture['cases'] as List) {
+      final draft = parseSmsDraft(item['raw'] as String);
+      expect(draft, isNotNull, reason: item['name'] as String);
+      expect(draft!.body, item['body'], reason: item['name'] as String);
+      // The OS removes just the SMS URI's outer encoding. The analyzed URL's
+      // escapes, casing, Unicode and delimiters must remain in that body.
+      expect(
+        Uri.decodeComponent(draft.address.split('?body=')[1]),
+        item['body'],
+        reason: item['name'] as String,
+      );
+      for (final url in [
+        ...item['urls'] as List,
+        ...item['candidates'] as List,
+      ]) {
+        expect(draft.body, contains(url), reason: item['name'] as String);
+      }
+    }
+    final draft = parseSmsDraft(
+      'smsto:01012340000:https://example.com/path?next=%26admin%3D1',
+    )!;
+    expect(
+      draft.address,
+      'sms:01012340000?body=https%3A%2F%2Fexample.com%2Fpath%3Fnext%3D%2526admin%253D1',
+    );
+  });
 
   test(
     'first explicit empty query body wins and subject colons are not delimiters',

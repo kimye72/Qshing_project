@@ -121,6 +121,58 @@ String _decodeRepeatedly(String value, {int rounds = 3}) {
   return value;
 }
 
+// Same token boundaries as qr_analyzer.URL_PATTERN/URL_CANDIDATE_PATTERN
+// (embedded URL policy 2.1). These spans protect message text; they do not
+// validate executable URLs or turn candidates into HTTPS addresses.
+final _visibleBodyUrl = RegExp(
+  r'''https?://[^\s<>'"]+''',
+  caseSensitive: false,
+);
+final _bodyUrlCandidate = RegExp(
+  r'''(?<![A-Za-z0-9@._-])(?<candidate>(?<domain>(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+(?:[A-Za-z]{2,63}|xn--[A-Za-z0-9-]{2,59}))(?<port>:[^/\s<>'"?#]*)?(?<path>/[^\s<>'"?#]*)?(?<query>\?[^\s<>'"#]*)?(?<fragment>\#[^\s<>'"]*)?)(?![A-Za-z0-9_:%-]|\.[A-Za-z0-9_-])''',
+  caseSensitive: false,
+);
+
+String _decodeLinkBody(String value, {int rounds = 3}) {
+  // Reveal encoded wrappers only until URL structure is visible. On each pass
+  // decode prose once and copy URL spans verbatim, including nested escapes.
+  // Match the backend analysis body, not its repeatedly decoded masked preview.
+  for (var round = 0; round < rounds; round++) {
+    final spans =
+        [
+          ..._visibleBodyUrl.allMatches(value),
+          ..._bodyUrlCandidate
+              .allMatches(value)
+              .where(
+                (match) => [
+                  'port',
+                  'path',
+                  'query',
+                  'fragment',
+                ].any((name) => match.namedGroup(name) != null),
+              ),
+        ]..sort((a, b) {
+          final start = a.start.compareTo(b.start);
+          return start == 0 ? a.end.compareTo(b.end) : start;
+        });
+    final pieces = StringBuffer();
+    var end = 0;
+    for (final span in spans) {
+      if (span.start < end) continue;
+      pieces.write(
+        _decodeRepeatedly(value.substring(end, span.start), rounds: 1),
+      );
+      pieces.write(value.substring(span.start, span.end));
+      end = span.end;
+    }
+    pieces.write(_decodeRepeatedly(value.substring(end), rounds: 1));
+    final decoded = pieces.toString();
+    if (decoded == value) break;
+    value = decoded;
+  }
+  return value;
+}
+
 String? _queryBody(String query) {
   for (final field in query.split('&')) {
     final equals = field.indexOf('=');
@@ -128,15 +180,16 @@ String? _queryBody(String query) {
     final key = _decodeRepeatedly(rawKey.replaceAll('+', ' '), rounds: 1);
     if (key != 'body') continue;
     final rawValue = equals < 0 ? '' : field.substring(equals + 1);
-    // parse_qs performs one form decoding pass; backend decodes two more.
+    // parse_qs performs one outer form pass before protecting visible URLs.
     final first = _decodeRepeatedly(rawValue.replaceAll('+', ' '), rounds: 1);
-    return _decodeRepeatedly(first, rounds: 2);
+    return _decodeLinkBody(first, rounds: 2);
   }
   return null;
 }
 
-// Mirrors qr_analyzer._parse_sms_payload's boundary-first parsing. Additional
-// recipient validation is intentional: a masking helper is not an action parser.
+// Mirrors qr_analyzer._parse_sms_payload(preserve_url_encoding: true), used by
+// _extract_structured_body for analysis. Additional recipient validation is
+// intentional: a masking helper is not an action parser.
 SmsDraft? parseSmsDraft(String raw) {
   final content = raw.trim();
   final lower = content.toLowerCase();
@@ -147,7 +200,7 @@ SmsDraft? parseSmsDraft(String raw) {
       final payload = content.substring(6);
       final colon = payload.indexOf(':');
       recipient = colon < 0 ? payload : payload.substring(0, colon);
-      body = colon < 0 ? null : _decodeRepeatedly(payload.substring(colon + 1));
+      body = colon < 0 ? null : _decodeLinkBody(payload.substring(colon + 1));
     } else if (lower.startsWith('sms:')) {
       final payload = content.substring(4);
       final question = payload.indexOf('?');
@@ -156,7 +209,7 @@ SmsDraft? parseSmsDraft(String raw) {
       if (body == null && recipient.contains(':')) {
         final colon = payload.indexOf(':');
         recipient = payload.substring(0, colon);
-        body = _decodeRepeatedly(payload.substring(colon + 1));
+        body = _decodeLinkBody(payload.substring(colon + 1));
       }
     } else {
       return null;
