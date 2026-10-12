@@ -591,6 +591,7 @@ class _ScanPageState extends State<ScanPage>
             key: const Key('scan-camera'),
             controller: _scannerController,
             useAppLifecycleState: false,
+            scanWindow: side > 0 ? hole : null,
             errorBuilder: (context, error) => const SizedBox.shrink(),
           ),
           if (_cameraReady && side > 0) ...[
